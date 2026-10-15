@@ -1,0 +1,2062 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Core Engine UI — Efficient File Transfer v4</title>
+    <style>
+        :root {
+            --bg-app: #0d1117;
+            --sidebar-bg: #131720;
+            --pane-bg: #161b24;
+            --pane-header: #1c2330;
+            --card-bg: #1e2633;
+            --input-bg: #0f131a;
+            --text-main: #e6edf3;
+            --text-secondary: #9da7b3;
+            --text-muted: #6e7681;
+            --border-color: #2b3240;
+            --border-subtle: #212733;
+            --accent: #2f81f7;
+            --accent-hover: #4090ff;
+            --accent-soft: rgba(47, 129, 247, 0.14);
+            --hover-row: rgba(255, 255, 255, 0.04);
+            --selected-row: rgba(47, 129, 247, 0.18);
+            --success: #3fb950;
+            --warning: #d29922;
+            --danger: #f85149;
+            --purple: #a371f7;
+        }
+
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; padding: 0;
+            background-color: var(--bg-app);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Inter, sans-serif;
+            font-size: 13px;
+            display: flex;
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* --- CUSTOM SCROLLBARS --- */
+        ::-webkit-scrollbar { width: 7px; height: 7px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #303746; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #434c5e; }
+
+        /* --- SIDEBAR --- */
+        .sidebar {
+            width: 280px;
+            min-width: 280px;
+            background-color: var(--sidebar-bg);
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            transition: width 0.2s cubic-bezier(0.4, 0, 0.2, 1), min-width 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            overflow: hidden;
+            flex-shrink: 0;
+        }
+        .sidebar.collapsed { width: 0; min-width: 0; border-right: none; }
+        .sidebar-header {
+            padding: 14px 14px 12px 14px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .brand-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-weight: 700;
+            font-size: 14.5px;
+            color: #fff;
+            letter-spacing: 0.2px;
+        }
+        .brand-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: var(--accent-soft);
+            color: #58a6ff;
+            border: 1px solid rgba(47, 129, 247, 0.35);
+            margin-left: 6px;
+        }
+        .new-transfer-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            width: 100%;
+            padding: 9px 14px;
+            border-radius: 8px;
+            background: linear-gradient(180deg, #388bfd 0%, #2f81f7 100%);
+            color: #ffffff;
+            font-weight: 600;
+            font-size: 13px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            cursor: pointer;
+            transition: all 0.15s ease;
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+        }
+        .new-transfer-btn:hover { background: var(--accent-hover); transform: translateY(-1px); }
+
+        .sidebar-section-label {
+            padding: 12px 14px 6px 14px;
+            font-size: 10.5px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.7px;
+            color: var(--text-muted);
+        }
+        .history-list {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 4px 10px 12px 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .history-item {
+            padding: 10px 11px;
+            border-radius: 8px;
+            cursor: pointer;
+            background-color: rgba(255, 255, 255, 0.015);
+            border: 1px solid var(--border-subtle);
+            transition: all 0.15s ease;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .history-item:hover {
+            background-color: var(--hover-row);
+            border-color: var(--border-color);
+        }
+        .history-item.active {
+            background-color: var(--accent-soft);
+            border-color: var(--accent);
+        }
+        .history-item-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 6px;
+        }
+        .history-title {
+            font-weight: 600;
+            font-size: 12.5px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            color: var(--text-main);
+        }
+        .history-peers {
+            font-size: 10.5px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-family: 'Cascadia Code', Consolas, monospace;
+        }
+        .history-meta {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+            color: var(--text-muted);
+        }
+        .mini-resume-btn {
+            margin-top: 2px;
+            padding: 4px 8px;
+            font-size: 11px;
+            border-radius: 5px;
+            background-color: rgba(63, 185, 80, 0.16);
+            color: #7ee787;
+            border: 1px solid rgba(63, 185, 80, 0.4);
+            cursor: pointer;
+            font-weight: 600;
+            width: 100%;
+            text-align: center;
+        }
+        .mini-resume-btn:hover { background-color: rgba(63, 185, 80, 0.28); color: #fff; }
+
+        /* --- BADGES --- */
+        .badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: 700;
+            text-transform: uppercase;
+            white-space: nowrap;
+            letter-spacing: 0.3px;
+        }
+        .badge-active { background: rgba(47, 129, 247, 0.2); color: #79c0ff; border: 1px solid rgba(47, 129, 247, 0.5); }
+        .badge-completed { background: rgba(63, 185, 80, 0.18); color: #7ee787; border: 1px solid rgba(63, 185, 80, 0.45); }
+        .badge-paused { background: rgba(210, 153, 34, 0.2); color: #e3b341; border: 1px solid rgba(210, 153, 34, 0.5); }
+        .badge-interrupted { background: rgba(248, 81, 73, 0.2); color: #ffa198; border: 1px solid rgba(248, 81, 73, 0.5); }
+        .badge-cancelled { background: rgba(139, 148, 158, 0.18); color: #b1bac4; border: 1px solid rgba(139, 148, 158, 0.4); }
+        .badge-rolled_back { background: rgba(248, 81, 73, 0.22); color: #ff7b72; border: 1px solid rgba(248, 81, 73, 0.5); }
+        .badge-pending { background: rgba(210, 153, 34, 0.15); color: #e3b341; border: 1px solid rgba(210, 153, 34, 0.4); }
+        .badge-locked { background: rgba(210, 153, 34, 0.18); color: #e3b341; border: 1px solid rgba(210, 153, 34, 0.45); font-size: 10.5px; padding: 2px 7px; border-radius: 4px; font-weight: 600; }
+        .badge-open { background: rgba(63, 185, 80, 0.15); color: #7ee787; border: 1px solid rgba(63, 185, 80, 0.4); font-size: 10.5px; padding: 2px 7px; border-radius: 4px; font-weight: 600; }
+
+        /* --- MAIN AREA & NON-CLIPPING TOP COMMAND BAR --- */
+        .main-area {
+            flex-grow: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            padding: 10px 12px;
+            gap: 10px;
+            overflow: hidden;
+        }
+        .toolbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 7px 12px;
+            background-color: var(--pane-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            gap: 12px;
+            flex-shrink: 0;
+            min-height: 46px;
+        }
+        .toolbar-left {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            min-width: 0;
+            flex: 1 1 auto;
+            overflow: hidden;
+        }
+        .toolbar-right {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        #toolbar-hint {
+            color: var(--text-secondary);
+            font-size: 12px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-left: 4px;
+        }
+
+        button {
+            background-color: var(--card-bg);
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            padding: 6px 11px;
+            cursor: pointer;
+            border-radius: 6px;
+            transition: all 0.14s ease;
+            font-family: inherit;
+            font-size: 12px;
+            font-weight: 500;
+            white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        button:hover { background-color: #293242; border-color: #3d4758; color: #ffffff; }
+        .action-btn { display: none; font-weight: 600; }
+        .btn-copy {
+            background: linear-gradient(180deg, #2f81f7 0%, #1f6feb 100%);
+            border-color: #388bfd;
+            color: #fff;
+            box-shadow: 0 2px 6px rgba(47, 129, 247, 0.3);
+        }
+        .btn-copy:hover { background: #388bfd; }
+        .btn-resume { background-color: rgba(63, 185, 80, 0.2); border-color: var(--success); color: #7ee787; }
+        .btn-pause { background-color: rgba(210, 153, 34, 0.18); border-color: var(--warning); color: #e3b341; }
+        .btn-cancel { background-color: rgba(248, 81, 73, 0.15); border-color: #ff7b72; color: #ffa198; }
+        .btn-rollback { background-color: rgba(248, 81, 73, 0.22); border-color: var(--danger); color: #ff7b72; }
+        .btn-connect-screen {
+            background-color: rgba(163, 113, 247, 0.14);
+            border-color: rgba(163, 113, 247, 0.45);
+            color: #d2a8ff;
+            font-weight: 600;
+        }
+        .btn-connect-screen:hover { background-color: rgba(163, 113, 247, 0.25); }
+        .btn-disconnect {
+            background-color: rgba(248, 81, 73, 0.12);
+            border-color: rgba(248, 81, 73, 0.4);
+            color: #ff7b72;
+            font-weight: 600;
+        }
+        .btn-disconnect:hover { background-color: rgba(248, 81, 73, 0.24); }
+
+        .status-pill {
+            padding: 5px 10px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 11.5px;
+            border: 1px solid var(--border-color);
+            background-color: var(--input-bg);
+            white-space: nowrap;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .status-online {
+            color: #7ee787;
+            border-color: rgba(63, 185, 80, 0.45);
+            background-color: rgba(63, 185, 80, 0.1);
+        }
+        .status-offline {
+            color: #ffa198;
+            border-color: rgba(248, 81, 73, 0.45);
+            background-color: rgba(248, 81, 73, 0.1);
+        }
+
+        /* --- DUAL-PANE FILE BROWSER WORKSPACE --- */
+        .workspace {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            flex-grow: 1;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .panel {
+            background-color: var(--pane-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .panel-title {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 9px 12px;
+            background-color: var(--pane-header);
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 600;
+            font-size: 12.5px;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+        .panel-title-text {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            color: #fff;
+        }
+        .os-badge {
+            font-size: 10px;
+            padding: 2px 7px;
+            border-radius: 4px;
+            background-color: rgba(47, 129, 247, 0.15);
+            color: #79c0ff;
+            border: 1px solid rgba(47, 129, 247, 0.35);
+            font-weight: 700;
+            letter-spacing: 0.4px;
+            flex-shrink: 0;
+        }
+
+        /* --- ADDRESS BAR & QUICK FILTER --- */
+        .address-bar {
+            display: flex;
+            gap: 5px;
+            padding: 7px 8px;
+            background-color: var(--sidebar-bg);
+            border-bottom: 1px solid var(--border-subtle);
+            align-items: center;
+            flex-shrink: 0;
+        }
+        .address-bar input.path-input {
+            flex: 1 1 auto;
+            min-width: 100px;
+            background: var(--input-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 6px 9px;
+            outline: none;
+            border-radius: 5px;
+            font-family: 'Cascadia Code', Consolas, monospace;
+            font-size: 12px;
+            transition: border-color 0.15s;
+        }
+        .address-bar input.filter-input {
+            width: 135px;
+            flex-shrink: 0;
+            background: var(--input-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 6px 8px;
+            outline: none;
+            border-radius: 5px;
+            font-size: 11.5px;
+        }
+        .address-bar input:focus { border-color: var(--accent); }
+        .nav-btn { padding: 5px 9px; font-weight: 700; min-width: 30px; justify-content: center; }
+
+        /* --- CLICKABLE BREADCRUMB STRIP --- */
+        .breadcrumb-bar {
+            display: flex;
+            align-items: center;
+            gap: 3px;
+            padding: 4px 10px;
+            background-color: rgba(15, 19, 26, 0.6);
+            border-bottom: 1px solid var(--border-color);
+            overflow-x: auto;
+            white-space: nowrap;
+            font-size: 11.5px;
+            min-height: 27px;
+            flex-shrink: 0;
+        }
+        .crumb-item {
+            color: var(--text-secondary);
+            padding: 2px 6px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: 0.12s;
+            font-family: 'Cascadia Code', Consolas, monospace;
+        }
+        .crumb-item:hover { background-color: var(--hover-row); color: #58a6ff; }
+        .crumb-sep { color: var(--text-muted); font-size: 10px; user-select: none; }
+
+        /* --- FILE LIST TABLE HEADER & TREE --- */
+        .list-header {
+            display: grid;
+            grid-template-columns: minmax(170px, 1fr) 130px 85px 38px;
+            padding: 7px 12px;
+            background-color: #181e29;
+            border-bottom: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 11.5px;
+            text-transform: uppercase;
+            letter-spacing: 0.4px;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        .tree-view {
+            padding: 4px 6px;
+            overflow-y: auto;
+            flex-grow: 1;
+            min-height: 0;
+        }
+        .tree-node { position: relative; }
+        .tree-item-container {
+            display: grid;
+            grid-template-columns: minmax(170px, 1fr) 130px 85px 38px;
+            align-items: center;
+            padding: 6px 8px;
+            margin-bottom: 1px;
+            cursor: pointer;
+            user-select: none;
+            border-radius: 6px;
+            border: 1px solid transparent;
+            transition: background-color 0.1s ease, border-color 0.1s ease;
+        }
+        .tree-item-container:hover {
+            background-color: var(--hover-row);
+            border-color: var(--border-subtle);
+        }
+        .tree-item-container.selected-row {
+            background-color: var(--selected-row);
+            border-color: rgba(47, 129, 247, 0.4);
+        }
+        .item-name {
+            display: flex;
+            align-items: center;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            gap: 6px;
+            padding-right: 8px;
+        }
+        .item-label {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            font-weight: 500;
+        }
+        .item-label.is-folder { color: #f0f6fc; font-weight: 600; }
+        .item-date { color: var(--text-secondary); white-space: nowrap; font-size: 11.5px; }
+        .item-size {
+            color: var(--text-secondary);
+            white-space: nowrap;
+            font-size: 11.5px;
+            font-family: 'Cascadia Code', Consolas, monospace;
+        }
+        .item-checkbox {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            padding-right: 4px;
+        }
+        .expander {
+            width: 18px;
+            height: 18px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-secondary);
+            font-family: monospace;
+            font-size: 11px;
+            border-radius: 4px;
+            background: rgba(255, 255, 255, 0.03);
+            flex-shrink: 0;
+        }
+        .expander.empty { background: transparent; }
+        .file-badge-icon {
+            font-size: 15px;
+            line-height: 1;
+            flex-shrink: 0;
+        }
+        .children-container {
+            display: none;
+            border-left: 1px dashed #323b4d;
+            margin-left: 15px;
+            padding-left: 10px;
+            margin-top: 2px;
+            margin-bottom: 2px;
+        }
+        input[type="checkbox"] {
+            accent-color: var(--accent);
+            width: 15px;
+            height: 15px;
+            margin: 0;
+            cursor: pointer;
+        }
+
+        /* --- PANE STATUS FOOTER --- */
+        .panel-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 12px;
+            background-color: var(--pane-header);
+            border-top: 1px solid var(--border-color);
+            font-size: 11px;
+            color: var(--text-secondary);
+            flex-shrink: 0;
+        }
+
+        /* --- SESSION HISTORY DETAIL VIEW --- */
+        .session-detail-view {
+            display: none;
+            flex-direction: column;
+            gap: 10px;
+            flex-grow: 1;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .session-summary-card {
+            background-color: var(--pane-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 14px 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+        .session-header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .session-title-group h2 { margin: 0 0 4px 0; font-size: 16px; color: #fff; }
+        .session-sub { font-size: 11.5px; color: var(--text-secondary); font-family: 'Cascadia Code', Consolas, monospace; }
+        .session-actions-group { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        .session-meta-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--border-color);
+        }
+        .meta-box {
+            background-color: var(--card-bg);
+            padding: 8px 11px;
+            border-radius: 6px;
+            border: 1px solid var(--border-subtle);
+        }
+        .meta-label { font-size: 10.5px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 3px; }
+        .meta-value { font-size: 12px; font-weight: 600; color: var(--text-main); word-break: break-all; }
+
+        .session-files-panel {
+            background-color: var(--pane-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            flex-grow: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .files-table-header {
+            display: grid;
+            grid-template-columns: 2.4fr 95px 95px 105px 165px;
+            padding: 8px 14px;
+            background-color: var(--pane-header);
+            border-bottom: 1px solid var(--border-color);
+            font-weight: 600;
+            color: var(--text-secondary);
+            font-size: 11.5px;
+            text-transform: uppercase;
+            flex-shrink: 0;
+        }
+        .files-table-body { overflow-y: auto; flex-grow: 1; min-height: 0; }
+        .files-table-row {
+            display: grid;
+            grid-template-columns: 2.4fr 95px 95px 105px 165px;
+            padding: 8px 14px;
+            border-bottom: 1px solid var(--border-subtle);
+            align-items: center;
+            font-size: 12px;
+        }
+        .files-table-row:hover { background-color: var(--hover-row); }
+        .rel-path-chip {
+            display: inline-block;
+            margin-top: 3px;
+            font-family: 'Cascadia Code', Consolas, monospace;
+            font-size: 11px;
+            color: #79c0ff;
+            background: rgba(47, 129, 247, 0.12);
+            padding: 1px 6px;
+            border-radius: 4px;
+            border: 1px solid rgba(47, 129, 247, 0.28);
+        }
+
+        /* --- PROGRESS BOX --- */
+        .progress-container {
+            padding: 10px 14px;
+            background: var(--pane-bg);
+            border: 1px solid var(--accent);
+            border-radius: 8px;
+            display: none;
+            flex-shrink: 0;
+        }
+        .progress-bar-bg {
+            width: 100%;
+            height: 8px;
+            background: var(--input-bg);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-bottom: 6px;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #2f81f7 0%, #58a6ff 100%);
+            width: 0%;
+            transition: width 0.25s ease;
+        }
+        .progress-stats { font-size: 12px; color: var(--text-secondary); display: flex; justify-content: space-between; font-weight: 600; }
+        .active-files-list { font-size: 11px; color: var(--text-secondary); margin-top: 5px; font-family: 'Cascadia Code', Consolas, monospace; }
+
+        /* --- WELCOME & CLIENT CONNECTION MODAL --- */
+        .connect-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(6, 9, 14, 0.82);
+            backdrop-filter: blur(6px);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            padding: 20px;
+        }
+        .connect-card {
+            width: 100%;
+            max-width: 730px;
+            background-color: var(--pane-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.7);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .connect-card-header {
+            padding: 18px 22px;
+            background: linear-gradient(135deg, #1b2536 0%, #151b26 100%);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .connect-card-header h1 { margin: 0; font-size: 17px; color: #fff; }
+        .connect-card-header p { margin: 4px 0 0 0; font-size: 12px; color: var(--text-secondary); }
+        .connect-card-body {
+            padding: 18px 22px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            max-height: 78vh;
+            overflow-y: auto;
+        }
+        .server-info-banner {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 10px 14px;
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            font-size: 12px;
+        }
+        .clients-grid { display: flex; flex-direction: column; gap: 8px; }
+        .waiting-client-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 14px;
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            transition: all 0.15s ease;
+            flex-wrap: wrap;
+        }
+        .waiting-client-row:hover { border-color: var(--accent); background-color: #242d3d; }
+        .client-meta-main { display: flex; align-items: center; gap: 12px; }
+        .client-device-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            background-color: var(--accent-soft);
+            border: 1px solid rgba(47, 129, 247, 0.3);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        /* --- PASSWORD PROMPT BOX --- */
+        .password-auth-box {
+            display: none;
+            flex-direction: column;
+            gap: 10px;
+            padding: 14px 16px;
+            background: rgba(210, 153, 34, 0.08);
+            border: 1px solid var(--warning);
+            border-radius: 8px;
+        }
+        .password-auth-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-weight: 600;
+            color: #e3b341;
+            font-size: 13px;
+        }
+        .password-auth-controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .password-auth-controls input {
+            flex-grow: 1;
+            background: var(--input-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 8px 10px;
+            border-radius: 6px;
+            outline: none;
+            font-family: 'Cascadia Code', Consolas, monospace;
+            font-size: 13px;
+        }
+        .password-auth-controls input:focus { border-color: var(--warning); }
+
+        .manual-connect-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            padding-top: 12px;
+            border-top: 1px solid var(--border-color);
+            flex-wrap: wrap;
+        }
+        .manual-connect-row input {
+            flex-grow: 1;
+            min-width: 180px;
+            background: var(--input-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 8px 10px;
+            border-radius: 6px;
+            outline: none;
+            font-family: 'Cascadia Code', Consolas, monospace;
+            font-size: 12px;
+        }
+        .manual-connect-row input:focus { border-color: var(--accent); }
+        .btn-primary-connect {
+            background: linear-gradient(180deg, #388bfd 0%, #2f81f7 100%);
+            color: #fff;
+            font-weight: 600;
+            border-color: #388bfd;
+            padding: 7px 14px;
+        }
+        .btn-primary-connect:hover { background: var(--accent-hover); }
+        .error-msg { color: #ff7b72; padding: 10px; font-size: 12px; }
+        .empty-state-box {
+            padding: 24px 16px;
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 12.5px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- LEFT SIDEBAR -->
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <div class="brand-row">
+                <div style="display:flex; align-items:center;">
+                    <span>⚡ EFT Engine</span>
+                    <span class="brand-badge">v4.0</span>
+                </div>
+                <button onclick="openConnectOverlay(true)"
+                    title="Open Client Discovery & Authentication modal"
+                    style="padding: 4px 8px; font-size: 11px;">🔌 Clients</button>
+            </div>
+            <button class="new-transfer-btn" id="btn-new-transfer"
+                onclick="switchToNewTransferView()"
+                title="Open dual-pane file browser to start a fresh transfer">
+                <span>＋ New Transfer</span>
+            </button>
+        </div>
+        <div class="sidebar-section-label">Transfer History</div>
+        <div class="history-list" id="history-list"></div>
+    </aside>
+
+    <!-- MAIN CONTENT -->
+    <main class="main-area">
+        <!-- SINGLE-LINE NON-CLIPPING TOOLBAR -->
+        <div class="toolbar">
+            <div class="toolbar-left">
+                <button onclick="toggleSidebar()" title="Toggle Transfer History Sidebar">☰ History</button>
+
+                <button id="btn-copy" class="action-btn btn-copy"
+                    onclick="sendCommand('start_transfer')"
+                    title="Start multithreaded transfer of checked remote items into the active local directory">
+                    🚀 Copy (0) Items
+                </button>
+
+                <button id="btn-pause" class="action-btn btn-pause"
+                    onclick="sendCommand('pause_transfer')"
+                    title="Pause active transfer while preserving received chunks">
+                    ⏸ Pause
+                </button>
+
+                <button id="btn-cancel" class="action-btn btn-cancel"
+                    onclick="sendCommand('cancel_transfer')"
+                    title="Cancel active transfer and delete ONLY incomplete partial files">
+                    ✖ Cancel (Partial)
+                </button>
+
+                <button id="btn-rollback" class="action-btn btn-rollback"
+                    onclick="sendCommand('rollback_transfer')"
+                    title="Rollback active transfer session by deleting all files transferred in this batch">
+                    ⟲ Rollback
+                </button>
+
+                <span id="toolbar-hint" title="Check files or folders in the Remote Source panel to start a transfer">
+                    Select remote files or folders to start a transfer
+                </span>
+            </div>
+
+            <div class="toolbar-right">
+                <button class="btn-connect-screen" onclick="openConnectOverlay(true)"
+                    title="View waiting clients, enter client password, or switch peers">
+                    🔌 Connect / Switch Client
+                </button>
+                <button id="btn-disconnect-toolbar" class="btn-disconnect" style="display:none;"
+                    onclick="disconnectCurrentClient()"
+                    title="Disconnect from the currently active client">
+                    Disconnect
+                </button>
+                <span id="transfer-state-pill" class="status-pill" title="Current engine state">State: IDLE</span>
+                <span id="client-status-pill" class="status-pill status-offline"
+                    onclick="openConnectOverlay(true)" style="cursor:pointer;"
+                    title="Click to connect or switch remote client">Client: Offline</span>
+            </div>
+        </div>
+
+        <!-- VIEW 1: DUAL-PANE FILE BROWSER -->
+        <div class="workspace" id="new-transfer-view">
+            <!-- Remote Source Panel -->
+            <div class="panel">
+                <div class="panel-title">
+                    <span class="panel-title-text" id="remote-panel-label">📱 Remote Source Device (Not Connected)</span>
+                    <span class="os-badge" id="remote-os-badge">REMOTE</span>
+                </div>
+                <div class="address-bar">
+                    <button class="nav-btn" onclick="navigateUp('remote')" title="Up to parent directory">↑</button>
+                    <input type="text" class="path-input" id="remote-path-input" value=""
+                        placeholder="Connect a client to browse remote path..."
+                        onkeydown="handleAddressKey(event, 'remote')">
+                    <button class="nav-btn" onclick="navigateToInput('remote')" title="Go to path">→</button>
+                    <button class="nav-btn" onclick="navigateToInput('remote')" title="Refresh directory">↻</button>
+                    <input type="text" class="filter-input" id="remote-filter-input"
+                        placeholder="🔍 Filter files..."
+                        oninput="filterTreeItems('remote', this.value)"
+                        title="Quickly filter items in the remote view">
+                </div>
+                <div class="breadcrumb-bar" id="remote-breadcrumbs"></div>
+                <div class="list-header">
+                    <span>Name</span>
+                    <span>Modified</span>
+                    <span>Size</span>
+                    <span style="text-align:right; padding-right:4px;">
+                        <input type="checkbox" id="remote-select-all"
+                            title="Select or unselect all visible items in Remote panel"
+                            onchange="toggleSelectAllRemote(this.checked)">
+                    </span>
+                </div>
+                <div class="tree-view" id="remote-tree"></div>
+                <div class="panel-footer">
+                    <span id="remote-footer-stats">0 folders, 0 files</span>
+                    <span id="remote-footer-selected" style="color:#79c0ff; font-weight:600;">0 selected</span>
+                </div>
+            </div>
+
+            <!-- Local Destination Panel -->
+            <div class="panel">
+                <div class="panel-title">
+                    <span class="panel-title-text" id="local-panel-label">💻 Local Destination Host</span>
+                    <span class="os-badge" id="local-os-badge">LOCAL</span>
+                </div>
+                <div class="address-bar">
+                    <button class="nav-btn" onclick="navigateUp('local')" title="Up to parent directory">↑</button>
+                    <input type="text" class="path-input" id="local-path-input" value=""
+                        placeholder="Enter local destination path..."
+                        onkeydown="handleAddressKey(event, 'local')">
+                    <button class="nav-btn" onclick="navigateToInput('local')" title="Go to path & set as destination">→</button>
+                    <button class="nav-btn" onclick="navigateToInput('local')" title="Refresh directory">↻</button>
+                    <input type="text" class="filter-input" id="local-filter-input"
+                        placeholder="🔍 Filter files..."
+                        oninput="filterTreeItems('local', this.value)"
+                        title="Quickly filter items in the local view">
+                </div>
+                <div class="breadcrumb-bar" id="local-breadcrumbs"></div>
+                <div class="list-header">
+                    <span>Name</span>
+                    <span>Modified</span>
+                    <span>Size</span>
+                    <span></span>
+                </div>
+                <div class="tree-view" id="local-tree"></div>
+                <div class="panel-footer">
+                    <span id="local-footer-stats">0 folders, 0 files</span>
+                    <span id="local-footer-dest" style="color:var(--text-muted); font-family:Consolas,monospace;">Active Target</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- VIEW 2: SESSION HISTORY INSPECTOR -->
+        <div class="session-detail-view" id="session-detail-view">
+            <div class="session-summary-card">
+                <div class="session-header-row">
+                    <div class="session-title-group">
+                        <div style="display:flex; align-items:center; gap:10px;">
+                            <h2 id="sd-title">Transfer Session</h2>
+                            <span id="sd-status-badge" class="badge badge-completed">COMPLETED</span>
+                        </div>
+                        <div class="session-sub" id="sd-token">Session ID: —</div>
+                    </div>
+
+                    <div class="session-actions-group">
+                        <button id="sd-btn-resume" class="btn-resume" style="display:none; font-weight:600;"
+                            onclick="triggerSessionAction('resume_transfer')">▶ Resume Incomplete Transfer</button>
+                        <button id="sd-btn-pause" class="btn-pause" style="display:none; font-weight:600;"
+                            onclick="triggerSessionAction('pause_transfer')">⏸ Pause Session</button>
+                        <button id="sd-btn-cancel" class="btn-cancel" style="display:none; font-weight:600;"
+                            onclick="triggerSessionAction('cancel_transfer')">✖ Cancel (Remove Partial)</button>
+                        <button id="sd-btn-rollback" class="btn-rollback" style="display:none; font-weight:600;"
+                            onclick="triggerSessionAction('rollback_transfer')">⟲ Rollback Session Files</button>
+                        <button onclick="switchToNewTransferView()">← Back to File Browser</button>
+                    </div>
+                </div>
+
+                <div>
+                    <div class="progress-bar-bg"><div class="progress-bar-fill" id="sd-progress-fill"></div></div>
+                    <div class="progress-stats">
+                        <span id="sd-progress-text">0% Complete</span>
+                        <span id="sd-chunks-text">0 / 0 Chunks</span>
+                    </div>
+                </div>
+
+                <div class="session-meta-grid">
+                    <div class="meta-box">
+                        <div class="meta-label">Server Host (Receiver)</div>
+                        <div class="meta-value" id="sd-server">—</div>
+                    </div>
+                    <div class="meta-box">
+                        <div class="meta-label">Client Device (Sender)</div>
+                        <div class="meta-value" id="sd-client">—</div>
+                    </div>
+                    <div class="meta-box">
+                        <div class="meta-label">Started Date & Time</div>
+                        <div class="meta-value" id="sd-started">—</div>
+                    </div>
+                    <div class="meta-box">
+                        <div class="meta-label">Completed / Last Updated</div>
+                        <div class="meta-value" id="sd-completed">—</div>
+                    </div>
+                    <div class="meta-box">
+                        <div class="meta-label">Server Destination Directory</div>
+                        <div class="meta-value" id="sd-dest">—</div>
+                    </div>
+                    <div class="meta-box">
+                        <div class="meta-label">Files & Data Transferred</div>
+                        <div class="meta-value" id="sd-files-bytes">0 / 0 Files (0 B / 0 B)</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="session-files-panel">
+                <div class="panel-title">
+                    <span>Transferred Files Log (Client Relative Path & Server Save Path)</span>
+                    <span id="sd-file-log-summary" style="color:var(--text-secondary); font-weight:normal;">0 items</span>
+                </div>
+                <div class="files-table-header">
+                    <span>File Name & Client Relative Path (Source -> Server)</span>
+                    <span>Size</span>
+                    <span>Chunks</span>
+                    <span>Status</span>
+                    <span>Date & Time Transferred</span>
+                </div>
+                <div class="files-table-body" id="sd-files-tbody"></div>
+            </div>
+        </div>
+
+        <!-- LIVE PROGRESS BAR FOR ACTIVE WORKSPACE -->
+        <div class="progress-container" id="progress-box">
+            <div class="progress-bar-bg"><div class="progress-bar-fill" id="pb-fill"></div></div>
+            <div class="progress-stats">
+                <span id="pb-text">0% Complete</span>
+                <span id="pb-chunks">0 / 0 Chunks</span>
+            </div>
+            <div class="active-files-list" id="pb-files"></div>
+        </div>
+    </main>
+
+    <!-- CLIENT DISCOVERY & PASSWORD AUTHENTICATION OVERLAY -->
+    <div class="connect-overlay" id="connect-overlay">
+        <div class="connect-card">
+            <div class="connect-card-header">
+                <div>
+                    <h1>⚡ EFT v4 — Client Discovery & Authentication</h1>
+                    <p>Select any waiting client below and enter its password (if locked) to establish a connection.</p>
+                </div>
+                <button onclick="closeConnectOverlay()">✕ Close</button>
+            </div>
+
+            <div class="connect-card-body">
+                <div class="server-info-banner">
+                    <div>
+                        <strong>Server Host:</strong> <span id="welcome-server-name">Loading...</span>
+                        (<span id="welcome-server-os">OS</span>)
+                    </div>
+                    <div>
+                        <strong>Server IP(s):</strong>
+                        <span id="welcome-server-ips" style="font-family:Consolas,monospace; color:#79c0ff;">—</span>
+                    </div>
+                </div>
+
+                <!-- Dynamic Client Password Prompt -->
+                <div class="password-auth-box" id="password-auth-box">
+                    <div class="password-auth-header">
+                        <span id="pwd-prompt-title">🔒 Password Required for Client</span>
+                        <button onclick="cancelPasswordPrompt()" style="padding:2px 8px; font-size:11px;">Cancel</button>
+                    </div>
+                    <div style="font-size:12px; color:var(--text-secondary);" id="pwd-prompt-subtitle">
+                        This client configured a password on startup. Enter the client's password to connect:
+                    </div>
+                    <div class="password-auth-controls">
+                        <input type="password" id="client-auth-password-input"
+                            placeholder="Enter client password..."
+                            onkeydown="if(event.key==='Enter'){submitClientPasswordPrompt();}">
+                        <button onclick="togglePasswordVisibility('client-auth-password-input')" title="Show/Hide Password">👁</button>
+                        <button class="btn-primary-connect" onclick="submitClientPasswordPrompt()">Authenticate & Connect</button>
+                    </div>
+                </div>
+
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-weight:600; font-size:13px;">Waiting Clients on Network</span>
+                    <button onclick="refreshWaitingClients(true)">↻ Scan for Waiting Clients</button>
+                </div>
+
+                <div class="clients-grid" id="waiting-clients-container">
+                    <div class="empty-state-box">Scanning network for waiting EFT clients...</div>
+                </div>
+
+                <div class="manual-connect-row">
+                    <input type="text" id="manual-client-ip"
+                        placeholder="Manual Client IP (e.g. 192.168.1.45 or 127.0.0.1:8083)..."
+                        onkeydown="if(event.key==='Enter'){connectByManualIp();}">
+                    <input type="password" id="manual-client-password" style="max-width: 195px;"
+                        placeholder="Password (if set on client)"
+                        onkeydown="if(event.key==='Enter'){connectByManualIp();}">
+                    <button class="btn-primary-connect" onclick="connectByManualIp()">Connect to IP</button>
+                </div>
+
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
+                    <div id="connect-feedback" style="font-size:12px; color:var(--text-secondary);"></div>
+                    <div id="curl-helper-text" style="font-size:11px; color:var(--text-muted); font-family:Consolas,monospace;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const panelState = {
+            remote: { currentPath: '', parentPath: '', initialized: false },
+            local: { currentPath: '', parentPath: '', initialized: false }
+        };
+
+        let currentViewMode = 'new_transfer';
+        let selectedSessionToken = null;
+        let welcomeAutoShown = false;
+        let lastPeerSeq = -1;
+        let pendingAuthTarget = null;
+
+        let lastProgressData = {
+            state: 'idle',
+            active_session_token: '',
+            server_hostname: '',
+            server_os: '',
+            server_ips: [],
+            client_online: false,
+            connected_client: null,
+            peer_seq: 0,
+            can_resume: false,
+            can_cancel: false,
+            can_rollback: false,
+            rollback_files_count: 0
+        };
+
+        function formatBytes(bytes) {
+            if (!bytes || bytes <= 0) return '0 B';
+            const k = 1024, sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function formatDate(ts, includeSeconds = false) {
+            if (!ts) return '—';
+            const d = new Date(ts * 1000);
+            const timeOpts = includeSeconds
+                ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
+                : { hour: '2-digit', minute: '2-digit' };
+            return d.toLocaleDateString() + " " + d.toLocaleTimeString([], timeOpts);
+        }
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.appendChild(document.createTextNode(str || ''));
+            return div.innerHTML;
+        }
+
+        function getFileIcon(name, isDir) {
+            if (isDir) return '📁';
+            const ext = (name.split('.').pop() || '').toLowerCase();
+            if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'heic'].includes(ext)) return '🖼️';
+            if (['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv'].includes(ext)) return '🎬';
+            if (['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a'].includes(ext)) return '🎵';
+            if (['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst'].includes(ext)) return '🗜️';
+            if (['py', 'js', 'ts', 'html', 'css', 'json', 'cpp', 'c', 'java', 'sh', 'xml', 'sql'].includes(ext)) return '💻';
+            if (['pdf', 'doc', 'docx', 'txt', 'md', 'rtf'].includes(ext)) return '📕';
+            if (['xls', 'xlsx', 'csv'].includes(ext)) return '📊';
+            if (['apk', 'exe', 'msi', 'deb', 'rpm'].includes(ext)) return '📦';
+            return '📄';
+        }
+
+        function getStatusBadgeClass(status) {
+            const s = (status || 'idle').toLowerCase();
+            return `badge badge-${s}`;
+        }
+
+        function toggleSidebar() {
+            document.getElementById('sidebar').classList.toggle('collapsed');
+        }
+
+        function togglePasswordVisibility(inputId) {
+            const el = document.getElementById(inputId);
+            if (!el) return;
+            el.type = el.type === 'password' ? 'text' : 'password';
+        }
+
+        function renderBreadcrumbs(source, fullPath) {
+            const bar = document.getElementById(`${source}-breadcrumbs`);
+            if (!bar) return;
+            bar.innerHTML = '';
+
+            if (!fullPath) {
+                bar.innerHTML = '<span style="color:var(--text-muted);">Not loaded</span>';
+                return;
+            }
+
+            if (fullPath === 'DRIVES') {
+                const rootCrumb = document.createElement('span');
+                rootCrumb.className = 'crumb-item';
+                rootCrumb.innerText = '🖥 Drives';
+                rootCrumb.onclick = () => initializeRoot(source, 'DRIVES');
+                bar.appendChild(rootCrumb);
+                return;
+            }
+
+            const isWin = fullPath.includes('\\') || /^[A-Za-z]:/.test(fullPath);
+            if (isWin) {
+                const drivesBtn = document.createElement('span');
+                drivesBtn.className = 'crumb-item';
+                drivesBtn.innerText = '🖥 Drives';
+                drivesBtn.onclick = () => initializeRoot(source, 'DRIVES');
+                bar.appendChild(drivesBtn);
+
+                const parts = fullPath.split(/\\+/).filter(Boolean);
+                let acc = '';
+                parts.forEach((part, idx) => {
+                    const sep = document.createElement('span');
+                    sep.className = 'crumb-sep';
+                    sep.innerText = '›';
+                    bar.appendChild(sep);
+
+                    acc = idx === 0 ? (part + '\\') : (acc.replace(/\\$/, '') + '\\' + part);
+                    const target = acc;
+                    const c = document.createElement('span');
+                    c.className = 'crumb-item';
+                    c.innerText = part;
+                    c.onclick = () => initializeRoot(source, target);
+                    bar.appendChild(c);
+                });
+            } else {
+                const rootBtn = document.createElement('span');
+                rootBtn.className = 'crumb-item';
+                rootBtn.innerText = '/';
+                rootBtn.onclick = () => initializeRoot(source, '/');
+                bar.appendChild(rootBtn);
+
+                const parts = fullPath.split('/').filter(Boolean);
+                let acc = '';
+                parts.forEach(part => {
+                    const sep = document.createElement('span');
+                    sep.className = 'crumb-sep';
+                    sep.innerText = '›';
+                    bar.appendChild(sep);
+
+                    acc += '/' + part;
+                    const target = acc;
+                    const c = document.createElement('span');
+                    c.className = 'crumb-item';
+                    c.innerText = part;
+                    c.onclick = () => initializeRoot(source, target);
+                    bar.appendChild(c);
+                });
+            }
+            bar.scrollLeft = bar.scrollWidth;
+        }
+
+        function filterTreeItems(source, query) {
+            const q = (query || '').trim().toLowerCase();
+            const tree = document.getElementById(`${source}-tree`);
+            if (!tree) return;
+            const nodes = tree.querySelectorAll(':scope > .tree-node');
+            nodes.forEach(node => {
+                const name = (node.getAttribute('data-name') || '').toLowerCase();
+                node.style.display = (!q || name.includes(q)) ? 'block' : 'none';
+            });
+        }
+
+        function toggleSelectAllRemote(checked) {
+            const tree = document.getElementById('remote-tree');
+            if (!tree) return;
+            tree.querySelectorAll('.tree-node').forEach(node => {
+                if (node.style.display === 'none') return;
+                const cb = node.querySelector(':scope > .tree-item-container input[type="checkbox"]');
+                const row = node.querySelector(':scope > .tree-item-container');
+                if (cb) {
+                    cb.checked = checked;
+                    if (row) row.classList.toggle('selected-row', checked);
+                }
+            });
+            updateSmartToolbar();
+        }
+
+        function resetRemoteBrowserState(reasonMsg = 'No client connected. Click "Connect / Switch Client" to choose a waiting device.') {
+            panelState.remote.currentPath = '';
+            panelState.remote.parentPath = '';
+            panelState.remote.initialized = false;
+            document.getElementById('remote-path-input').value = '';
+            document.getElementById('remote-filter-input').value = '';
+            document.getElementById('remote-select-all').checked = false;
+            document.getElementById('remote-os-badge').innerText = 'REMOTE';
+            document.getElementById('remote-panel-label').innerText = '📱 Remote Source Device (Not Connected)';
+            document.getElementById('remote-breadcrumbs').innerHTML = '<span style="color:var(--text-muted);">Offline</span>';
+            document.getElementById('remote-footer-stats').innerText = '0 folders, 0 files';
+            document.getElementById('remote-footer-selected').innerText = '0 selected';
+            document.getElementById('remote-tree').innerHTML =
+                `<div class="empty-state-box">${escapeHtml(reasonMsg)}</div>`;
+            updateSmartToolbar();
+        }
+
+        /* --- VIEW SWITCHING --- */
+        function switchToNewTransferView() {
+            currentViewMode = 'new_transfer';
+            selectedSessionToken = null;
+            document.getElementById('new-transfer-view').style.display = 'grid';
+            document.getElementById('session-detail-view').style.display = 'none';
+            document.querySelectorAll('.history-item').forEach(el => el.classList.remove('active'));
+            updateSmartToolbar();
+        }
+
+        async function openSessionDetail(sessionToken) {
+            currentViewMode = 'session_detail';
+            selectedSessionToken = sessionToken;
+            document.getElementById('new-transfer-view').style.display = 'none';
+            document.getElementById('session-detail-view').style.display = 'flex';
+            document.getElementById('progress-box').style.display = 'none';
+            updateSmartToolbar();
+            await refreshSelectedSessionDetail();
+            await loadSessionsSidebar();
+        }
+
+        async function refreshSelectedSessionDetail() {
+            if (!selectedSessionToken) return;
+            try {
+                const res = await fetch(`/api/sessions/${encodeURIComponent(selectedSessionToken)}`);
+                const data = await res.json();
+                if (data.status !== 'success' || !data.session) return;
+
+                const s = data.session;
+                document.getElementById('sd-title').innerText = s.title || 'Transfer Session';
+                const badge = document.getElementById('sd-status-badge');
+                badge.className = getStatusBadgeClass(s.status);
+                badge.innerText = (s.status || 'idle').replace('_', ' ').toUpperCase();
+
+                document.getElementById('sd-token').innerText = `Session ID: ${s.session_token}`;
+                document.getElementById('sd-progress-fill').style.width = `${s.percent}%`;
+                document.getElementById('sd-progress-text').innerText = `${s.percent}% (${(s.status || '').toUpperCase()})`;
+                document.getElementById('sd-chunks-text').innerText = `${s.received_chunks} / ${s.total_chunks} Chunks`;
+
+                document.getElementById('sd-server').innerText =
+                    `${s.server_name || 'Server'} (${s.server_ip || 'LAN'}) [${(s.server_os || 'OS').toUpperCase()}]`;
+                const clientIdSuffix = s.client_id ? ` · ID: ${s.client_id}` : '';
+                document.getElementById('sd-client').innerText =
+                    `${s.client_name || 'Client'} (${s.client_ip || 'LAN'}) [${(s.client_os || 'OS').toUpperCase()}]${clientIdSuffix}`;
+
+                document.getElementById('sd-started').innerText = formatDate(s.started_at, true);
+                document.getElementById('sd-completed').innerText = s.completed_at
+                    ? formatDate(s.completed_at, true)
+                    : formatDate(s.updated_at, true);
+                document.getElementById('sd-dest').innerText = s.destination_path || '—';
+                document.getElementById('sd-files-bytes').innerText =
+                    `${s.completed_files} / ${s.total_files} Files (${formatBytes(s.transferred_bytes)} / ${formatBytes(s.total_bytes)})`;
+
+                document.getElementById('sd-btn-resume').style.display = (s.can_resume && lastProgressData.client_online) ? 'inline-flex' : 'none';
+                document.getElementById('sd-btn-pause').style.display = (s.status === 'active') ? 'inline-flex' : 'none';
+                document.getElementById('sd-btn-cancel').style.display = s.can_cancel ? 'inline-flex' : 'none';
+                document.getElementById('sd-btn-rollback').style.display = s.can_rollback ? 'inline-flex' : 'none';
+
+                const tbody = document.getElementById('sd-files-tbody');
+                const files = s.files || [];
+                document.getElementById('sd-file-log-summary').innerText = `${files.length} file(s) logged`;
+
+                if (files.length === 0) {
+                    tbody.innerHTML = '<div class="empty-state-box">No files recorded for this session yet.</div>';
+                } else {
+                    tbody.innerHTML = files.map(f => {
+                        const isDirEntry = (f.relative_path || '').endsWith('/');
+                        const displayName = isDirEntry
+                            ? (f.relative_path.replace(/\/$/, '').split('/').pop() || f.relative_path) + ' (Empty Folder)'
+                            : (f.name || f.relative_path);
+                        const itemIcon = isDirEntry ? '📁' : getFileIcon(f.name || '', false);
+                        const sizeLabel = isDirEntry ? 'Folder' : formatBytes(f.size);
+                        return `
+                        <div class="files-table-row" title="Client Source: ${escapeHtml(f.source_path || f.relative_path || '')}\nServer Saved: ${escapeHtml(f.save_path || '')}">
+                            <div style="overflow:hidden; text-overflow:ellipsis; padding-right:10px;">
+                                <div style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                                    ${itemIcon} <strong>${escapeHtml(displayName)}</strong>
+                                </div>
+                                <div class="rel-path-chip" title="Client Relative Path">${escapeHtml(f.relative_path)}</div>
+                            </div>
+                            <div style="color:var(--text-secondary); font-family:Consolas,monospace;">${sizeLabel}</div>
+                            <div style="color:var(--text-secondary); font-family:Consolas,monospace;">${f.chunks_done}/${f.chunks_total}</div>
+                            <div><span class="${getStatusBadgeClass(f.status)}">${escapeHtml(f.status)}</span></div>
+                            <div style="color:var(--text-secondary);">${f.transferred_at ? formatDate(f.transferred_at, true) : 'Not completed'}</div>
+                        </div>
+                        `;
+                    }).join('');
+                }
+            } catch (e) {}
+        }
+
+        async function triggerSessionAction(actionType, explicitToken = null) {
+            const targetToken = explicitToken || selectedSessionToken;
+            if (!targetToken) return;
+            await fetch('/api/action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    action: actionType,
+                    session_token: targetToken
+                })
+            });
+            await pollProgress();
+            await loadSessionsSidebar();
+            if (selectedSessionToken === targetToken) {
+                await refreshSelectedSessionDetail();
+            }
+        }
+
+        async function loadSessionsSidebar() {
+            try {
+                const res = await fetch('/api/sessions');
+                const data = await res.json();
+                const listEl = document.getElementById('history-list');
+                if (data.status !== 'success' || !Array.isArray(data.sessions)) return;
+
+                if (data.sessions.length === 0) {
+                    listEl.innerHTML = '<div class="empty-state-box">No transfer history yet. Connect a client and start a transfer.</div>';
+                    return;
+                }
+
+                listEl.innerHTML = '';
+                data.sessions.forEach(sess => {
+                    const item = document.createElement('div');
+                    item.className = 'history-item' + (selectedSessionToken === sess.session_token ? ' active' : '');
+                    item.title =
+                        `${sess.title}\n` +
+                        `Status: ${sess.status.toUpperCase()}\n` +
+                        `Client: ${sess.client_name} (${sess.client_ip}) [${(sess.client_os || '').toUpperCase()}]\n` +
+                        `Server: ${sess.server_name} (${sess.server_ip}) [${(sess.server_os || '').toUpperCase()}]\n` +
+                        `Started: ${formatDate(sess.started_at, true)}`;
+                    item.onclick = () => openSessionDetail(sess.session_token);
+
+                    const topRow = document.createElement('div');
+                    topRow.className = 'history-item-top';
+                    topRow.innerHTML = `
+                        <span class="history-title">📁 ${escapeHtml(sess.title)}</span>
+                        <span class="${getStatusBadgeClass(sess.status)}">${escapeHtml(sess.status.replace('_', ' '))}</span>
+                    `;
+
+                    const peerRow = document.createElement('div');
+                    peerRow.className = 'history-peers';
+                    peerRow.innerText = `${sess.client_name} (${sess.client_ip || '?'}) → ${sess.server_name}`;
+
+                    const bottomRow = document.createElement('div');
+                    bottomRow.className = 'history-meta';
+                    bottomRow.innerHTML = `
+                        <span>${formatDate(sess.started_at)}</span>
+                        <span>${sess.completed_files}/${sess.total_files} · ${formatBytes(sess.total_bytes)}</span>
+                    `;
+
+                    item.appendChild(topRow);
+                    item.appendChild(peerRow);
+                    item.appendChild(bottomRow);
+
+                    if (sess.can_resume && lastProgressData.client_online) {
+                        const rBtn = document.createElement('button');
+                        rBtn.className = 'mini-resume-btn';
+                        rBtn.innerText = `▶ Resume Incomplete (${sess.percent}%)`;
+                        rBtn.onclick = (e) => {
+                            e.stopPropagation();
+                            openSessionDetail(sess.session_token);
+                            triggerSessionAction('resume_transfer', sess.session_token);
+                        };
+                        item.appendChild(rBtn);
+                    }
+
+                    listEl.appendChild(item);
+                });
+            } catch (e) {}
+        }
+
+        /* --- CLIENT CONNECTION & PASSWORD HANDSHAKE --- */
+        function openConnectOverlay(probeNow = false) {
+            document.getElementById('connect-overlay').style.display = 'flex';
+            document.getElementById('connect-feedback').innerText = '';
+            refreshWaitingClients(probeNow);
+        }
+
+        function closeConnectOverlay() {
+            document.getElementById('connect-overlay').style.display = 'none';
+            cancelPasswordPrompt();
+        }
+
+        function openPasswordPromptForClient(clientId, ip, invitePort, hostname, customSubtitle = null) {
+            pendingAuthTarget = { clientId, ip, invitePort, hostname };
+            const box = document.getElementById('password-auth-box');
+            document.getElementById('pwd-prompt-title').innerText =
+                `🔒 Enter Password for ${hostname || ip} (${ip}:${invitePort})`;
+            document.getElementById('pwd-prompt-subtitle').innerText = customSubtitle ||
+                'This client is password-protected. Enter the password configured on the client terminal:';
+            const input = document.getElementById('client-auth-password-input');
+            input.value = '';
+            box.style.display = 'flex';
+            setTimeout(() => input.focus(), 50);
+        }
+
+        function cancelPasswordPrompt() {
+            pendingAuthTarget = null;
+            document.getElementById('password-auth-box').style.display = 'none';
+            document.getElementById('client-auth-password-input').value = '';
+        }
+
+        async function submitClientPasswordPrompt() {
+            if (!pendingAuthTarget) return;
+            const pwd = document.getElementById('client-auth-password-input').value;
+            if (!pwd) {
+                const fb = document.getElementById('connect-feedback');
+                fb.style.color = '#e3b341';
+                fb.innerText = 'Please enter the client password before clicking Authenticate & Connect.';
+                return;
+            }
+            const t = pendingAuthTarget;
+            await connectToWaitingClient(t.clientId, t.ip, t.invitePort, pwd, t.hostname);
+        }
+
+        async function refreshWaitingClients(sendProbe = false) {
+            try {
+                const res = await fetch(`/api/clients/waiting?probe=${sendProbe ? 'true' : 'false'}`);
+                const data = await res.json();
+                if (data.status !== 'success') return;
+
+                document.getElementById('welcome-server-name').innerText = data.server_hostname || 'EFT-Server';
+                document.getElementById('welcome-server-os').innerText = (data.server_os || '').toUpperCase();
+                const ips = data.server_ips || [];
+                document.getElementById('welcome-server-ips').innerText = ips.join(', ');
+                if (ips.length > 0) {
+                    document.getElementById('curl-helper-text').innerText =
+                        `curl http://${ips[0]}:${window.location.port || 8081}/download/client.py -o client.py`;
+                }
+
+                const container = document.getElementById('waiting-clients-container');
+                const clients = data.waiting_clients || [];
+
+                if (clients.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state-box" style="background:var(--card-bg); border:1px dashed var(--border-color); border-radius:8px;">
+                            No waiting clients detected on the network right now.<br>
+                            <span style="font-size:11.5px; color:var(--text-muted);">Run <code>python client.py</code> on your Android, Windows, or Linux device and choose Option 1.</span>
+                        </div>
+                    `;
+                    return;
+                }
+
+                container.innerHTML = '';
+                clients.forEach(c => {
+                    const row = document.createElement('div');
+                    row.className = 'waiting-client-row';
+                    const osIcon = c.os === 'android' ? '📱' : (c.os === 'windows' ? '💻' : '🐧');
+                    const securityBadge = c.requires_password
+                        ? `<span class="badge-locked">🔒 Password Protected</span>`
+                        : `<span class="badge-open">🔓 Open (No Password)</span>`;
+
+                    const left = document.createElement('div');
+                    left.className = 'client-meta-main';
+                    left.innerHTML = `
+                        <div class="client-device-icon">${osIcon}</div>
+                        <div>
+                            <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                                <span style="font-weight:600; font-size:13.5px; color:#fff;">${escapeHtml(c.hostname)}</span>
+                                <span class="os-badge">${escapeHtml((c.os || 'os').toUpperCase())}</span>
+                                ${securityBadge}
+                            </div>
+                            <div style="font-size:11.5px; color:var(--text-secondary); font-family:Consolas,monospace; margin-top:3px;">
+                                IP: ${escapeHtml(c.ip)}:${c.invite_port} · ID: ${escapeHtml(c.client_id)} · Seen ${c.age_seconds}s ago
+                            </div>
+                        </div>
+                    `;
+
+                    const right = document.createElement('div');
+                    right.style.display = 'flex';
+                    right.style.gap = '8px';
+                    right.style.alignItems = 'center';
+
+                    if (c.is_connected) {
+                        const connBadge = document.createElement('span');
+                        connBadge.className = 'status-pill status-online';
+                        connBadge.innerText = '✓ Connected';
+                        right.appendChild(connBadge);
+
+                        const discBtn = document.createElement('button');
+                        discBtn.className = 'btn-disconnect';
+                        discBtn.innerText = 'Disconnect';
+                        discBtn.onclick = () => disconnectCurrentClient();
+                        right.appendChild(discBtn);
+                    } else {
+                        const btn = document.createElement('button');
+                        btn.className = 'btn-primary-connect';
+                        btn.innerText = c.requires_password ? '🔑 Enter Password & Connect' : 'Click to Connect';
+                        btn.onclick = () => {
+                            if (c.requires_password) {
+                                openPasswordPromptForClient(c.client_id, c.ip, c.invite_port, c.hostname);
+                            } else {
+                                cancelPasswordPrompt();
+                                connectToWaitingClient(c.client_id, c.ip, c.invite_port, "", c.hostname);
+                            }
+                        };
+                        right.appendChild(btn);
+                    }
+
+                    row.appendChild(left);
+                    row.appendChild(right);
+                    container.appendChild(row);
+                });
+            } catch (e) {}
+        }
+
+        async function connectToWaitingClient(clientId, ip, invitePort, password = "", hostname = "") {
+            const fb = document.getElementById('connect-feedback');
+            fb.style.color = '#79c0ff';
+            fb.innerText = `Sending handshake to ${hostname || ip} (${ip}:${invitePort})...`;
+            try {
+                const res = await fetch('/api/clients/connect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        client_id: clientId,
+                        ip: ip,
+                        invite_port: invitePort,
+                        password: password
+                    })
+                });
+                const data = await res.json();
+
+                if (data.status === 'success') {
+                    fb.style.color = '#7ee787';
+                    fb.innerText = data.message || 'Connected!';
+                    cancelPasswordPrompt();
+                    resetRemoteBrowserState('Loading remote client filesystem...');
+                    await pollProgress();
+                    await initializeRoot('remote', '');
+                    await refreshWaitingClients(false);
+                    setTimeout(() => closeConnectOverlay(), 300);
+                } else if (data.status === 'password_required' || data.status === 'auth_error') {
+                    fb.style.color = '#ff7b72';
+                    fb.innerText = data.message || 'Authentication required.';
+                    openPasswordPromptForClient(
+                        clientId,
+                        ip,
+                        invitePort,
+                        hostname || ip,
+                        data.status === 'auth_error'
+                            ? '❌ Incorrect password rejected by client. Please re-enter the client password:'
+                            : data.message
+                    );
+                } else {
+                    fb.style.color = '#ff7b72';
+                    fb.innerText = data.message || 'Connection failed.';
+                }
+            } catch (e) {
+                fb.style.color = '#ff7b72';
+                fb.innerText = 'Network error while connecting to client.';
+            }
+        }
+
+        function connectByManualIp() {
+            const val = document.getElementById('manual-client-ip').value.trim();
+            const pwd = document.getElementById('manual-client-password').value;
+            if (!val) return;
+            connectToWaitingClient(null, val, 8083, pwd, val);
+        }
+
+        async function disconnectCurrentClient() {
+            try {
+                await fetch('/api/clients/disconnect', { method: 'POST' });
+                resetRemoteBrowserState('Disconnected from client. Click "Connect / Switch Client" to connect to any waiting client.');
+                await pollProgress();
+                await refreshWaitingClients(true);
+            } catch (e) {}
+        }
+
+        /* --- DIRECTORY NAVIGATION & TREE RENDERING --- */
+        function handleAddressKey(event, source) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                navigateToInput(source);
+            }
+        }
+
+        function navigateToInput(source) {
+            const inputField = document.getElementById(`${source}-path-input`);
+            initializeRoot(source, inputField.value.trim());
+        }
+
+        function navigateUp(source) {
+            const parentPath = panelState[source].parentPath;
+            if (parentPath) {
+                initializeRoot(source, parentPath);
+            } else {
+                navigateToInput(source);
+            }
+        }
+
+        function updateSmartToolbar() {
+            const checkedBoxes = document.querySelectorAll('#remote-tree input[type="checkbox"]:checked');
+            const checkedCount = checkedBoxes.length;
+            const state = lastProgressData.state || 'idle';
+            const clientOnline = !!lastProgressData.client_online;
+
+            const selFooter = document.getElementById('remote-footer-selected');
+            if (selFooter) {
+                selFooter.innerText = `${checkedCount} item${checkedCount === 1 ? '' : 's'} selected`;
+            }
+
+            const btnCopy = document.getElementById('btn-copy');
+            const btnPause = document.getElementById('btn-pause');
+            const btnCancel = document.getElementById('btn-cancel');
+            const btnRollback = document.getElementById('btn-rollback');
+            const btnDisconnect = document.getElementById('btn-disconnect-toolbar');
+            const hint = document.getElementById('toolbar-hint');
+
+            btnCopy.style.display = 'none';
+            btnPause.style.display = 'none';
+            btnCancel.style.display = 'none';
+            btnRollback.style.display = 'none';
+            btnDisconnect.style.display = clientOnline ? 'inline-flex' : 'none';
+
+            if (currentViewMode === 'session_detail') {
+                hint.style.display = 'inline';
+                hint.innerText = 'Inspecting Transfer Session History';
+                return;
+            }
+
+            if (state !== 'active' && checkedCount > 0 && clientOnline) {
+                btnCopy.style.display = 'inline-flex';
+                btnCopy.innerText = `🚀 Copy (${checkedCount}) Item${checkedCount > 1 ? 's' : ''}`;
+            }
+
+            if (state === 'active') {
+                btnPause.style.display = 'inline-flex';
+                btnCancel.style.display = 'inline-flex';
+            }
+
+            if (state === 'active' && lastProgressData.can_rollback) {
+                btnRollback.style.display = 'inline-flex';
+            }
+
+            const anyVisible = [btnCopy, btnPause, btnCancel, btnRollback].some(b => b.style.display !== 'none');
+            if (!anyVisible) {
+                hint.style.display = 'inline';
+                hint.innerText = clientOnline
+                    ? 'Check remote files or folders to start a transfer'
+                    : 'No client connected — click "Connect / Switch Client"';
+            } else {
+                hint.style.display = 'none';
+            }
+        }
+
+        async function initializeRoot(source, requestedPath = '') {
+            const inputField = document.getElementById(`${source}-path-input`);
+            const targetPath = requestedPath !== undefined ? requestedPath : inputField.value.trim();
+            const filterField = document.getElementById(`${source}-filter-input`);
+            if (filterField) filterField.value = '';
+            if (source === 'remote') {
+                const selAll = document.getElementById('remote-select-all');
+                if (selAll) selAll.checked = false;
+            }
+            const treeContainer = document.getElementById(`${source}-tree`);
+            treeContainer.innerHTML = '<div class="empty-state-box">Loading directory...</div>';
+            await fetchAndRender(treeContainer, source, targetPath, true);
+        }
+
+        async function fetchAndRender(container, source, path, isRootLoad = false) {
+            try {
+                let response;
+                if (source === 'local') {
+                    const url = `/api/local/browse?path=${encodeURIComponent(path || '')}&set_save_dir=${isRootLoad ? 'true' : 'false'}`;
+                    response = await fetch(url);
+                } else {
+                    response = await fetch('/api/remote/browse', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ path: path || '' })
+                    });
+                }
+
+                const data = await response.json();
+                if (data.os) {
+                    const badge = document.getElementById(`${source}-os-badge`);
+                    if (badge) badge.innerText = data.os.toUpperCase();
+                }
+
+                if (data.status === 'success' && Array.isArray(data.items)) {
+                    panelState[source].initialized = true;
+                    if (data.current_path && isRootLoad) {
+                        panelState[source].currentPath = data.current_path;
+                        document.getElementById(`${source}-path-input`).value = data.current_path;
+                        renderBreadcrumbs(source, data.current_path);
+                        if (source === 'local') {
+                            document.getElementById('local-footer-dest').innerText = `Save Target: ${data.current_path}`;
+                        }
+                    }
+                    if (data.parent_path && isRootLoad) {
+                        panelState[source].parentPath = data.parent_path;
+                    }
+
+                    if (isRootLoad) {
+                        let dirCount = 0, fileCount = 0, totalBytes = 0;
+                        data.items.forEach(it => {
+                            if (it.is_dir) dirCount++;
+                            else { fileCount++; totalBytes += (it.size || 0); }
+                        });
+                        const statsEl = document.getElementById(`${source}-footer-stats`);
+                        if (statsEl) {
+                            statsEl.innerText = `${dirCount} folder${dirCount === 1 ? '' : 's'}, ${fileCount} file${fileCount === 1 ? '' : 's'} (${formatBytes(totalBytes)})`;
+                        }
+                    }
+
+                    container.innerHTML = '';
+                    if (data.items.length === 0) {
+                        container.innerHTML = '<div class="empty-state-box">(Empty directory)</div>';
+                        return;
+                    }
+
+                    data.items.forEach(item => {
+                        const node = document.createElement('div');
+                        node.className = 'tree-node';
+                        node.setAttribute('data-name', item.name || '');
+
+                        const icon = `<span class="file-badge-icon">${getFileIcon(item.name || '', item.is_dir)}</span>`;
+                        const expander = item.is_dir
+                            ? '<span class="expander">▸</span>'
+                            : '<span class="expander empty"></span>';
+
+                        const row = document.createElement('div');
+                        row.className = 'tree-item-container';
+                        row.title = item.is_dir
+                            ? `Click to expand folder: ${item.path} (Double-click to open as root)`
+                            : `File: ${item.path} (${formatBytes(item.size)})`;
+
+                        const nameCol = document.createElement('div');
+                        nameCol.className = 'item-name';
+                        nameCol.innerHTML = `${expander}${icon}<span class="item-label ${item.is_dir ? 'is-folder' : ''}">${escapeHtml(item.name)}</span>`;
+
+                        const dateCol = document.createElement('div');
+                        dateCol.className = 'item-date';
+                        dateCol.innerText = formatDate(item.mtime);
+
+                        const sizeCol = document.createElement('div');
+                        sizeCol.className = 'item-size';
+                        sizeCol.innerText = item.is_dir ? '—' : formatBytes(item.size);
+
+                        const checkCol = document.createElement('div');
+                        checkCol.className = 'item-checkbox';
+                        let cb = null;
+                        if (source === 'remote' && data.current_path !== 'DRIVES') {
+                            cb = document.createElement('input');
+                            cb.type = 'checkbox';
+                            cb.value = item.path;
+                            cb.title = `Select ${item.name} for transfer`;
+                            cb.onclick = (e) => e.stopPropagation();
+                            cb.onchange = () => {
+                                row.classList.toggle('selected-row', cb.checked);
+                                updateSmartToolbar();
+                            };
+                            checkCol.appendChild(cb);
+                        }
+
+                        row.appendChild(nameCol);
+                        row.appendChild(dateCol);
+                        row.appendChild(sizeCol);
+                        row.appendChild(checkCol);
+
+                        const childrenContainer = document.createElement('div');
+                        childrenContainer.className = 'children-container';
+
+                        if (item.is_dir) {
+                            row.onclick = () => toggleFolder(node, source, item.path);
+                            row.ondblclick = (e) => {
+                                e.stopPropagation();
+                                initializeRoot(source, item.path);
+                            };
+                        } else if (cb) {
+                            row.onclick = () => {
+                                cb.checked = !cb.checked;
+                                row.classList.toggle('selected-row', cb.checked);
+                                updateSmartToolbar();
+                            };
+                        }
+
+                        node.appendChild(row);
+                        node.appendChild(childrenContainer);
+                        container.appendChild(node);
+                    });
+                    updateSmartToolbar();
+                } else {
+                    container.innerHTML = `<div class="error-msg">${escapeHtml(data.message || 'Unable to load directory.')}</div>`;
+                }
+            } catch (e) {
+                container.innerHTML = `<div class="error-msg">Network Error loading directory</div>`;
+            }
+        }
+
+        async function toggleFolder(node, source, path) {
+            const children = node.querySelector(':scope > .children-container');
+            const expander = node.querySelector(':scope > .tree-item-container .expander');
+            document.getElementById(`${source}-path-input`).value = path;
+            panelState[source].currentPath = path;
+            renderBreadcrumbs(source, path);
+
+            if (source === 'local' && path !== 'DRIVES') {
+                document.getElementById('local-footer-dest').innerText = `Save Target: ${path}`;
+                fetch('/api/local/browse', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: path, set_save_dir: true })
+                }).catch(() => {});
+            }
+
+            if (children.style.display === 'block') {
+                children.style.display = 'none';
+                if (expander) expander.innerText = '▸';
+            } else {
+                children.style.display = 'block';
+                if (expander) expander.innerText = '▾';
+                if (children.innerHTML === '') {
+                    children.innerHTML = '<div style="padding:6px; color:var(--text-muted);">Loading...</div>';
+                    await fetchAndRender(children, source, path, false);
+                }
+            }
+        }
+
+        async function sendCommand(actionType) {
+            const checkedBoxes = Array.from(document.querySelectorAll('#remote-tree input[type="checkbox"]:checked')).map(cb => cb.value);
+            const destPath = document.getElementById('local-path-input').value.trim();
+
+            const res = await fetch('/api/action', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    action: actionType,
+                    paths: checkedBoxes,
+                    dest_path: destPath,
+                    session_token: lastProgressData.active_session_token || null
+                })
+            });
+            const data = await res.json();
+
+            if (actionType === 'start_transfer' && data.session_token) {
+                document.querySelectorAll('#remote-tree input[type="checkbox"]:checked').forEach(cb => {
+                    cb.checked = false;
+                    const row = cb.closest('.tree-item-container');
+                    if (row) row.classList.remove('selected-row');
+                });
+                const selAll = document.getElementById('remote-select-all');
+                if (selAll) selAll.checked = false;
+            }
+            if (actionType === 'cancel_transfer' || actionType === 'rollback_transfer') {
+                setTimeout(() => initializeRoot('local', destPath), 300);
+            }
+            await pollProgress();
+            await loadSessionsSidebar();
+        }
+
+        async function pollProgress() {
+            try {
+                const res = await fetch('/api/progress');
+                const data = await res.json();
+                const prevOnline = lastProgressData.client_online;
+                const prevState = lastProgressData.state;
+                const peerChanged = (lastPeerSeq !== -1 && data.peer_seq !== lastPeerSeq);
+                lastPeerSeq = data.peer_seq || 0;
+                lastProgressData = data;
+
+                if (data.server_hostname) {
+                    const srvIps = (data.server_ips || []).join(', ');
+                    document.getElementById('local-panel-label').innerText =
+                        `💻 Local Destination: ${data.server_hostname} (${srvIps || 'Local'})`;
+                }
+
+                if (!welcomeAutoShown && !data.client_online) {
+                    welcomeAutoShown = true;
+                    openConnectOverlay(true);
+                } else if (data.client_online) {
+                    welcomeAutoShown = true;
+                }
+
+                if (data.client_online && (!prevOnline || peerChanged || !panelState.remote.initialized)) {
+                    panelState.remote.currentPath = '';
+                    panelState.remote.parentPath = '';
+                    document.getElementById('remote-path-input').value = '';
+                    initializeRoot('remote', '');
+                } else if (!data.client_online && prevOnline) {
+                    resetRemoteBrowserState('Remote client disconnected. Click "Connect / Switch Client" to connect a waiting client.');
+                }
+
+                if (prevState === 'active' && data.state === 'completed') {
+                    initializeRoot('local', document.getElementById('local-path-input').value.trim());
+                    loadSessionsSidebar();
+                }
+
+                const clientPill = document.getElementById('client-status-pill');
+                if (data.client_online && data.connected_client) {
+                    const c = data.connected_client;
+                    const lockIcon = c.requires_password ? '🔒 ' : '🟢 ';
+                    clientPill.innerText = `${lockIcon}Client: ${c.hostname} (${c.ip})`;
+                    clientPill.className = 'status-pill status-online';
+                    document.getElementById('remote-panel-label').innerText =
+                        `📱 Remote Source: ${c.hostname} (${c.ip})`;
+                    if (c.os) {
+                        document.getElementById('remote-os-badge').innerText = c.os.toUpperCase();
+                    }
+                } else {
+                    clientPill.innerText = '🔴 Client: Offline';
+                    clientPill.className = 'status-pill status-offline';
+                }
+
+                const statePill = document.getElementById('transfer-state-pill');
+                statePill.innerText = `State: ${(data.state || 'idle').toUpperCase()}`;
+
+                const box = document.getElementById('progress-box');
+                if (currentViewMode === 'new_transfer' && data.state === 'active') {
+                    box.style.display = 'block';
+                    document.getElementById('pb-fill').style.width = data.percent + '%';
+                    document.getElementById('pb-text').innerText = `${data.percent}% Transferring...`;
+                    document.getElementById('pb-chunks').innerText = `${data.received} / ${data.total} Chunks`;
+                    document.getElementById('pb-files').innerText =
+                        (data.active_files || []).map(f => `[${f.done}/${f.total}] ${f.relative_path || f.name}`).join(' | ');
+                } else {
+                    box.style.display = 'none';
+                }
+
+                if (currentViewMode === 'session_detail' && selectedSessionToken) {
+                    refreshSelectedSessionDetail();
+                }
+
+                if (document.getElementById('connect-overlay').style.display === 'flex') {
+                    refreshWaitingClients(false);
+                }
+
+                updateSmartToolbar();
+            } catch (e) {}
+        }
+
+        setInterval(pollProgress, 1000);
+        setInterval(loadSessionsSidebar, 2500);
+
+        window.onload = async () => {
+            await initializeRoot('local', '');
+            await loadSessionsSidebar();
+            await pollProgress();
+            if (lastProgressData.client_online) {
+                await initializeRoot('remote', '');
+            } else {
+                resetRemoteBrowserState();
+            }
+        };
+    </script>
+</body>
+</html>
