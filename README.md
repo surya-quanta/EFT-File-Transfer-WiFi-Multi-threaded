@@ -86,6 +86,8 @@ Every session logs full **Server Host** (`Name`, `IP`, `OS`) and **Client Device
 
 ![EFT v4 Session History Inspector and Per-File Audit Log](assets/screenshots/04-session-history-inspector.png)
 
+![EFT Client v4 Session History Inspector and Per-File Audit Log](assets/screenshots/04-client-session-history-inspector.jpeg)
+
 ---
 
 ### E. Interactive Terminal UI (TUI) & Nano-Style History Viewer
@@ -93,7 +95,7 @@ Both `server.py` and `client.py` include an interactive terminal startup menu an
 
 ![EFT v4 Interactive Terminal Startup Menu and Nano-Style History Viewer](assets/screenshots/05-terminal-tui-viewer.png)
 
-![EFT v4 Interactive Terminal Startup Menu Client](assets/screenshots/05-terminal-tui-client.png)
+![EFT v4 Interactive Terminal Startup Menu Client](assets/screenshots/05-terminal-tui-client.jpeg)
 
 ---
 
