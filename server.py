@@ -7,6 +7,7 @@ import sqlite3
 import os
 import sys
 import math
+import queue
 import struct
 import time
 import signal
@@ -95,6 +96,7 @@ def get_primary_local_ip():
             return ip
     return ips[0] if ips else '127.0.0.1'
 
+
 def get_broadcast_targets():
     """Return 255.255.255.255, 127.0.0.1, and directed subnet broadcasts (x.x.x.255) for all local NICs."""
     targets = {'255.255.255.255', '127.0.0.1'}
@@ -103,6 +105,7 @@ def get_broadcast_targets():
         if len(parts) == 4 and not ip.startswith('127.'):
             targets.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
     return sorted(targets)
+
 
 def get_default_save_directory():
     if LOCAL_OS == 'windows':
@@ -118,6 +121,7 @@ def get_default_save_directory():
 
 SAVE_DIRECTORY = get_default_save_directory()
 os.makedirs(SAVE_DIRECTORY, exist_ok=True)
+REMOTE_ACTIVE_DIRECTORY = ""
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DB_PATH = os.path.join(BASE_DIR, 'transfer_state.db')
@@ -143,6 +147,12 @@ peer_connection_seq = 0
 
 active_worker_connections = set()
 worker_conn_lock = threading.Lock()
+
+# Server-side PUSH (Server -> Client) producer pipeline state
+push_transfer_active = False
+push_transfer_lock = threading.Lock()
+push_work_queue = None
+console_print_lock = threading.Lock()
 
 waiting_clients = {}
 waiting_clients_lock = threading.Lock()
@@ -172,7 +182,6 @@ def verify_client_password_hash(received_hash, client_ip=None, client_id=None):
                 return True
         if recv == active_client_password_hash:
             return True
-        # If no password was configured on the client and no pending hash was set, allow empty hash
         if not active_client_password_hash and recv == "":
             return True
     return False
@@ -206,6 +215,16 @@ def resolve_local_save_path(base_dir, rel_path):
     if not full_path.startswith(base_abs):
         raise ValueError("Invalid relative path outside target directory")
     return full_path
+
+
+def format_remote_save_path(remote_base_dir, rel_path, remote_os='linux'):
+    """Format a display destination path for files pushed to the remote client."""
+    norm = normalize_rel_path(rel_path)
+    base = str(remote_base_dir or '').rstrip('/\\')
+    if (remote_os or '').lower() == 'windows' or '\\' in base or (len(base) >= 2 and base[1] == ':'):
+        rel_win = norm.replace('/', '\\')
+        return f"{base}\\{rel_win}" if base else rel_win
+    return f"{base}/{norm}" if base else norm
 
 
 def list_os_directory(target_path, default_path):
@@ -278,9 +297,74 @@ def list_os_directory(target_path, default_path):
         return {"status": "error", "message": str(e), "os": LOCAL_OS, "current_path": target_path}
 
 
+def build_local_manifest(target_paths):
+    """Build a POSIX-normalized file & empty-folder manifest from local server paths for PUSH transfers."""
+    manifest = {"files": [], "dirs": [], "total_bytes": 0}
+    local_mapping = {}
+
+    for raw_target in target_paths:
+        target_path = os.path.abspath(os.path.expanduser(str(raw_target)))
+        if not os.path.exists(target_path):
+            continue
+
+        parent_dir = os.path.dirname(target_path.rstrip('/\\'))
+
+        if os.path.isfile(target_path):
+            try:
+                stat = os.stat(target_path)
+                rel_path = normalize_rel_path(os.path.basename(target_path))
+                manifest["files"].append({
+                    "relative_path": rel_path,
+                    "source_path": target_path,
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "atime": stat.st_atime
+                })
+                manifest["total_bytes"] += stat.st_size
+                local_mapping[rel_path] = target_path
+            except (PermissionError, OSError):
+                continue
+
+        elif os.path.isdir(target_path):
+            for root, dirs, files in os.walk(target_path):
+                if not files and not dirs:
+                    try:
+                        stat = os.stat(root)
+                        rel_dir = normalize_rel_path(os.path.relpath(root, parent_dir))
+                        if rel_dir:
+                            manifest["dirs"].append({
+                                "relative_path": rel_dir,
+                                "source_path": root,
+                                "mtime": stat.st_mtime,
+                                "atime": stat.st_atime
+                            })
+                    except (PermissionError, OSError):
+                        pass
+
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    try:
+                        stat = os.stat(full_path)
+                        rel_raw = os.path.relpath(full_path, parent_dir)
+                        rel_path = normalize_rel_path(rel_raw)
+                        manifest["files"].append({
+                            "relative_path": rel_path,
+                            "source_path": full_path,
+                            "size": stat.st_size,
+                            "mtime": stat.st_mtime,
+                            "atime": stat.st_atime
+                        })
+                        manifest["total_bytes"] += stat.st_size
+                        local_mapping[rel_path] = full_path
+                    except (PermissionError, OSError):
+                        continue
+
+    return manifest, local_mapping
+
+
 # ==============================================================================
 # DUAL SQLITE DATABASES:
-# 1. transfer_state.db   -> Active chunk bitmaps & file locks
+# 1. transfer_state.db   -> Active chunk bitmaps & file locks (for both PULL & PUSH)
 # 2. transfer_history.db -> Permanent session logs & per-file transfer history
 # ==============================================================================
 db_lock = threading.RLock()
@@ -336,6 +420,7 @@ def init_dbs():
         CREATE TABLE IF NOT EXISTS transfer_sessions (
             session_token TEXT PRIMARY KEY,
             title TEXT,
+            direction TEXT DEFAULT 'pull',
             server_name TEXT,
             server_ip TEXT,
             server_os TEXT,
@@ -375,9 +460,10 @@ def init_dbs():
         )
     """)
 
-    # Safe schema migrations for existing v3 databases
+    # Safe schema migrations for existing v2.4 databases
     s_cols = [r[1] for r in hconn.execute("PRAGMA table_info(transfer_sessions)").fetchall()]
     for col_name, col_def in [
+        ('direction', "TEXT DEFAULT 'pull'"),
         ('server_name', 'TEXT'),
         ('server_ip', 'TEXT'),
         ('server_os', 'TEXT'),
@@ -390,14 +476,14 @@ def init_dbs():
     if 'source_path' not in hf_cols:
         hconn.execute("ALTER TABLE transfer_history_files ADD COLUMN source_path TEXT")
 
-    # Backfill any empty server metadata on older rows
     default_srv_ip = get_primary_local_ip()
     hconn.execute("""
         UPDATE transfer_sessions
         SET server_name = COALESCE(NULLIF(server_name, ''), ?),
             server_ip   = COALESCE(NULLIF(server_ip, ''), ?),
-            server_os   = COALESCE(NULLIF(server_os, ''), ?)
-        WHERE server_name IS NULL OR server_name = ''
+            server_os   = COALESCE(NULLIF(server_os, ''), ?),
+            direction   = COALESCE(NULLIF(direction, ''), 'pull')
+        WHERE server_name IS NULL OR server_name = '' OR direction IS NULL OR direction = ''
     """, (LOCAL_HOSTNAME, default_srv_ip, LOCAL_OS))
 
     # Mark any previously 'active' sessions that had pending chunks as 'interrupted' on startup
@@ -489,6 +575,16 @@ def make_session_title(paths):
     if len(paths) == 1:
         return first
     return f"{first} + {len(paths) - 1} more"
+
+
+def get_session_direction(session_token):
+    if not session_token:
+        return 'pull'
+    with db_lock:
+        row = history_conn.execute(
+            "SELECT direction FROM transfer_sessions WHERE session_token=?", (session_token,)
+        ).fetchone()
+        return (row[0] or 'pull').lower() if row else 'pull'
 
 
 def sync_session_metrics(session_token, override_status=None):
@@ -589,7 +685,26 @@ def send_control_command(payload):
             return False
 
 
+def stop_push_workers():
+    """Stop the server-side PUSH chunk producer and drain push_work_queue."""
+    global push_transfer_active, push_work_queue
+    push_transfer_active = False
+    if push_work_queue is not None:
+        while not push_work_queue.empty():
+            try:
+                push_work_queue.get_nowait()
+                push_work_queue.task_done()
+            except Exception:
+                break
+        for _ in range(4):
+            try:
+                push_work_queue.put_nowait(None)
+            except Exception:
+                pass
+
+
 def close_active_workers():
+    stop_push_workers()
     with worker_conn_lock:
         conns = list(active_worker_connections)
     for c in conns:
@@ -597,6 +712,7 @@ def close_active_workers():
             c.close()
         except Exception:
             pass
+
 
 def disconnect_client_cleanly():
     """Disconnect the currently connected client so the next Ctrl+C shuts down the server."""
@@ -622,7 +738,7 @@ def has_active_incomplete_transfer(session_token=None):
         return False
     with db_lock:
         s_row = history_conn.execute(
-            "SELECT status FROM transfer_sessions WHERE session_token=?", (tok,)
+            "SELECT status, received_chunks, total_chunks FROM transfer_sessions WHERE session_token=?", (tok,)
         ).fetchone()
         if not s_row or s_row[0] != 'active':
             return False
@@ -631,7 +747,9 @@ def has_active_incomplete_transfer(session_token=None):
             INNER JOIN files f ON c.file_id = f.file_id
             WHERE f.session_token = ? AND c.status = 'pending'
         """, (tok,)).fetchone()
-        return bool(c_row and (c_row[0] or 0) > 0)
+        if c_row and (c_row[0] or 0) > 0:
+            return True
+        return (s_row[1] or 0) < (s_row[2] or 0)
 
 
 def cleanup_empty_parent_dirs(file_path, base_dir):
@@ -653,8 +771,10 @@ def cleanup_empty_parent_dirs(file_path, base_dir):
 
 def perform_cancel(session_token=None, reason="User cancelled transfer"):
     """
-    Cancel operation for a specific session (or active session):
-    Stops transfer and removes ONLY partial (incomplete) files for that session.
+    Cancel operation for a specific session (both PULL and PUSH):
+    - For PULL: deletes incomplete partial files on the Server disk.
+    - For PUSH: instructs the Client to delete incomplete partial files on the Client disk,
+      while cleaning up pending chunk state in the Server databases.
     Completed files remain intact on disk and in history.
     """
     global current_active_token
@@ -669,8 +789,9 @@ def perform_cancel(session_token=None, reason="User cancelled transfer"):
                 print(f"[*] Session {session_token[:8]} is already completed; skipping cancel.")
                 return 0
 
-    print(f"[*] Executing Cancel ({reason}) for session {session_token}: removing only partial files...")
-    send_control_command({"action": "cancel_transfer", "session_token": session_token})
+    direction = get_session_direction(session_token)
+    print(f"[*] Executing Cancel ({reason}) for {direction.upper()} session {session_token}: removing only partial files...")
+    send_control_command({"action": "cancel_transfer", "session_token": session_token, "direction": direction})
     if session_token == current_active_token or not session_token:
         close_active_workers()
         time.sleep(0.15)
@@ -699,17 +820,21 @@ def perform_cancel(session_token=None, reason="User cancelled transfer"):
 
         incomplete_files = cursor.fetchall()
         for file_id, rel_path, save_path, pre_existed in incomplete_files:
-            target = save_path if save_path else resolve_local_save_path(base_save_dir, rel_path)
-            flock = get_file_lock(file_id)
-            with flock:
-                if target and os.path.exists(target) and not pre_existed:
-                    try:
-                        os.remove(target)
-                        cleanup_empty_parent_dirs(target, base_save_dir)
-                        removed_count += 1
-                    except Exception as e:
-                        print(f"[!] Could not remove partial file {target}: {e}")
-            release_file_lock(file_id)
+            if direction == 'pull':
+                target = save_path if save_path else resolve_local_save_path(base_save_dir, rel_path)
+                flock = get_file_lock(file_id)
+                with flock:
+                    if target and os.path.exists(target) and not pre_existed:
+                        try:
+                            os.remove(target)
+                            cleanup_empty_parent_dirs(target, base_save_dir)
+                            removed_count += 1
+                        except Exception as e:
+                            print(f"[!] Could not remove partial file {target}: {e}")
+                release_file_lock(file_id)
+            else:
+                removed_count += 1
+
             db_conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
             db_conn.execute("DELETE FROM files WHERE file_id=?", (file_id,))
             if session_token:
@@ -720,6 +845,11 @@ def perform_cancel(session_token=None, reason="User cancelled transfer"):
                 """, (session_token, rel_path))
 
         if session_token:
+            history_conn.execute("""
+                UPDATE transfer_history_files
+                SET status='cancelled'
+                WHERE session_token=? AND status != 'completed'
+            """, (session_token,))
             sync_session_metrics(session_token, override_status='cancelled')
             if current_active_token == session_token:
                 current_active_token = None
@@ -728,22 +858,24 @@ def perform_cancel(session_token=None, reason="User cancelled transfer"):
             set_meta('transfer_state', 'idle')
 
     finalize_db_wal()
-    print(f"[*] Cancel complete. Removed {removed_count} partial file(s). Completed files were kept.")
+    print(f"[*] Cancel complete. Cleaned up {removed_count} partial file(s). Completed files were kept.")
     return removed_count
 
 
 def perform_rollback(session_token=None):
     """
-    Rollback operation for a specific transfer session:
-    Stops transfer (if active) and removes ALL files transferred in that particular transfer session
-    (both completed and partial files created in that session).
+    Rollback operation for a specific transfer session (both PULL and PUSH):
+    - For PULL: deletes all non-pre-existing files & empty dirs created on the Server in that session.
+    - For PUSH: instructs the Client to delete all non-pre-existing files & empty dirs created on the Client
+      in that session, and updates Server state/history to 'rolled_back'.
     """
     global current_active_token
     if not session_token:
         session_token = current_active_token or get_meta('session_token')
 
-    print(f"[*] Executing Rollback for session {session_token}: removing all files from this transfer...")
-    send_control_command({"action": "rollback_transfer", "session_token": session_token})
+    direction = get_session_direction(session_token)
+    print(f"[*] Executing Rollback for {direction.upper()} session {session_token}: removing all files from this transfer...")
+    send_control_command({"action": "rollback_transfer", "session_token": session_token, "direction": direction})
     if session_token == current_active_token:
         close_active_workers()
         time.sleep(0.15)
@@ -776,22 +908,27 @@ def perform_rollback(session_token=None):
                 files_to_remove[rpath] = (fid, spath, pre)
 
         for rel_path, (file_id, save_path, pre_existed) in files_to_remove.items():
-            target = save_path if save_path else resolve_local_save_path(base_save_dir, rel_path)
-            flock = get_file_lock(file_id) if file_id else threading.Lock()
-            with flock:
-                if target and os.path.exists(target) and not pre_existed:
-                    try:
-                        if os.path.isdir(target):
-                            if not os.listdir(target):
-                                os.rmdir(target)
+            if direction == 'pull':
+                target = save_path if save_path else resolve_local_save_path(base_save_dir, rel_path)
+                flock = get_file_lock(file_id) if file_id else threading.Lock()
+                with flock:
+                    if target and os.path.exists(target) and not pre_existed:
+                        try:
+                            if os.path.isdir(target):
+                                if not os.listdir(target):
+                                    os.rmdir(target)
+                                    cleanup_empty_parent_dirs(target, base_save_dir)
+                                    removed_count += 1
+                            else:
+                                os.remove(target)
                                 cleanup_empty_parent_dirs(target, base_save_dir)
                                 removed_count += 1
-                        else:
-                            os.remove(target)
-                            cleanup_empty_parent_dirs(target, base_save_dir)
-                            removed_count += 1
-                    except Exception as e:
-                        print(f"[!] Could not remove item during rollback {target}: {e}")
+                        except Exception as e:
+                            print(f"[!] Could not remove item during rollback {target}: {e}")
+            else:
+                if not pre_existed:
+                    removed_count += 1
+
             if file_id:
                 release_file_lock(file_id)
                 db_conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
@@ -822,19 +959,20 @@ def perform_rollback(session_token=None):
             set_meta('session_token', '')
 
     finalize_db_wal()
-    print(f"[*] Rollback complete. Removed {removed_count} transferred file(s).")
+    print(f"[*] Rollback complete. Removed {removed_count} transferred item(s).")
     return removed_count
 
 
 def perform_pause(session_token=None):
     """
-    Pause operation:
+    Pause operation (both PULL and PUSH):
     Halts active transfer while keeping partial files and chunk records intact for per-session resumption.
     """
     global current_active_token
     target_token = session_token or current_active_token or get_meta('session_token')
-    print(f"[*] Pausing transfer session {target_token}...")
-    send_control_command({"action": "pause_transfer", "session_token": target_token})
+    direction = get_session_direction(target_token)
+    print(f"[*] Pausing {direction.upper()} transfer session {target_token}...")
+    send_control_command({"action": "pause_transfer", "session_token": target_token, "direction": direction})
     close_active_workers()
     with db_lock:
         set_meta('transfer_state', 'paused')
@@ -842,6 +980,372 @@ def perform_pause(session_token=None):
             sync_session_metrics(target_token, override_status='paused')
         current_active_token = None
     finalize_db_wal()
+
+
+# ==============================================================================
+# SERVER-SIDE PUSH ENGINE (Server -> Client Producer & Worker Stream Handler)
+# ==============================================================================
+def process_and_compress_push_chunks(local_mapping, manifest, chunk_queue, missing_map):
+    """Server-side producer thread that reads & compresses local missing chunks for PUSH transfer."""
+    global push_transfer_active
+    cctx = zstd.ZstdCompressor(level=3) if HAS_ZSTD else None
+
+    for file_info in manifest.get("files", []):
+        if not push_transfer_active:
+            break
+
+        rel_path = file_info["relative_path"]
+        if rel_path not in missing_map:
+            continue
+
+        m_entry = missing_map[rel_path]
+        client_file_id = m_entry["file_id"]
+        server_file_id = m_entry.get("server_file_id", client_file_id)
+        missing_indices = sorted(m_entry.get("missing", []))
+        full_path = local_mapping.get(rel_path) or file_info.get("source_path")
+        if not full_path or not os.path.exists(full_path):
+            continue
+
+        try:
+            with open(full_path, 'rb') as f:
+                for chunk_index in missing_indices:
+                    if not push_transfer_active:
+                        break
+                    f.seek(chunk_index * CHUNK_SIZE)
+                    raw_bytes = f.read(CHUNK_SIZE)
+                    if not raw_bytes and file_info["size"] > 0:
+                        break
+                    compressed = cctx.compress(raw_bytes) if HAS_ZSTD else zlib.compress(raw_bytes, level=1)
+                    while push_transfer_active:
+                        try:
+                            chunk_queue.put({
+                                "client_file_id": client_file_id,
+                                "server_file_id": server_file_id,
+                                "relative_path": rel_path,
+                                "file_size": file_info["size"],
+                                "chunk_index": chunk_index,
+                                "data": compressed
+                            }, timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
+        except (PermissionError, OSError):
+            continue
+
+    for _ in range(4):
+        try:
+            chunk_queue.put(None, timeout=1.0)
+        except Exception:
+            pass
+
+
+def start_push_session_on_server(session_token, paths, remote_dest_dir, is_resume=False):
+    """Build the local manifest on the server, record history rows, and send start_push_transfer to client."""
+    global current_active_token
+    stop_push_workers()
+    enable_db_wal()
+
+    manifest, _ = build_local_manifest(paths)
+    now = time.time()
+    title = make_session_title(paths)
+    c_id = (connected_client_info or {}).get("client_id", "")
+    c_name = (connected_client_info or {}).get("hostname", "Remote Client")
+    c_ip = (connected_client_info or {}).get("ip", "")
+    c_os = (connected_client_info or {}).get("os", "linux")
+    srv_ip = (connected_client_info or {}).get("server_ip") or get_primary_local_ip()
+
+    with db_lock:
+        active_sessions.add(session_token)
+        current_active_token = session_token
+        set_meta('target_paths', json.dumps(paths))
+        set_meta('remote_destination', remote_dest_dir)
+        set_meta('transfer_state', 'active')
+        set_meta('session_token', session_token)
+
+        existing = history_conn.execute(
+            "SELECT started_at, title FROM transfer_sessions WHERE session_token=?", (session_token,)
+        ).fetchone()
+        started_at = existing[0] if (existing and existing[0]) else now
+        if existing and existing[1]:
+            title = existing[1]
+
+        history_conn.execute("""
+            INSERT OR REPLACE INTO transfer_sessions (
+                session_token, title, direction,
+                server_name, server_ip, server_os,
+                client_id, client_name, client_ip, client_os,
+                source_paths, destination_path, started_at, updated_at,
+                total_files, completed_files, total_bytes, transferred_bytes,
+                total_chunks, received_chunks, status
+            ) VALUES (?, ?, 'push', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0, 0, 'active')
+        """, (
+            session_token, title,
+            LOCAL_HOSTNAME, srv_ip, LOCAL_OS,
+            c_id, c_name, c_ip, c_os,
+            json.dumps(paths), remote_dest_dir, started_at, now,
+            len(manifest.get("files", [])), manifest.get("total_bytes", 0)
+        ))
+
+    sent = send_control_command({
+        "action": "start_push_transfer",
+        "session_token": session_token,
+        "session_title": title,
+        "source_paths": paths,
+        "destination_path": remote_dest_dir,
+        "manifest": manifest,
+        "server_hostname": LOCAL_HOSTNAME,
+        "server_ip": srv_ip,
+        "server_os": LOCAL_OS,
+        "resume": is_resume
+    })
+    if not sent:
+        finalize_db_wal()
+    return sent
+
+
+def handle_push_manifest_processed(msg):
+    """
+    Process the client's response after pre-allocating files for a PUSH transfer,
+    populate server chunk tracking tables, and spawn the server-side chunk producer thread.
+    """
+    global push_transfer_active, push_work_queue
+    token = msg.get("session_token")
+    if not token or token not in active_sessions:
+        return
+
+    missing_map = msg.get("missing_map") or {}
+    already_completed = set(msg.get("already_completed") or [])
+    pre_existed_map = msg.get("pre_existed_map") or {}
+    remote_dest_dir = msg.get("destination_path") or get_meta('remote_destination', '')
+    now_ts = time.time()
+
+    with db_lock:
+        s_row = history_conn.execute(
+            "SELECT source_paths, title, client_name, client_ip, client_os FROM transfer_sessions WHERE session_token=?",
+            (token,)
+        ).fetchone()
+        if not s_row:
+            return
+        try:
+            paths = json.loads(s_row[0] or '[]')
+        except Exception:
+            paths = []
+        sess_title = s_row[1] or "Push Transfer"
+        c_name = s_row[2] or "Remote Client"
+        c_ip = s_row[3] or ""
+        c_os = s_row[4] or "linux"
+
+        if remote_dest_dir:
+            history_conn.execute(
+                "UPDATE transfer_sessions SET destination_path=? WHERE session_token=?",
+                (remote_dest_dir, token)
+            )
+
+    manifest, local_mapping = build_local_manifest(paths)
+
+    with db_lock:
+        # Reset server-side file/chunk bitmap for this PUSH session and rebuild from client's missing_map
+        db_conn.execute("DELETE FROM chunks WHERE file_id IN (SELECT file_id FROM files WHERE session_token=?)", (token,))
+        db_conn.execute("DELETE FROM files WHERE session_token=?", (token,))
+
+        for dinfo in manifest.get("dirs", []):
+            norm_dir = normalize_rel_path(dinfo.get("relative_path", ""))
+            if not norm_dir:
+                continue
+            dir_rel_display = norm_dir.rstrip('/') + '/'
+            remote_dir_save = format_remote_save_path(remote_dest_dir, norm_dir, c_os)
+            dir_pre = 1 if pre_existed_map.get(dir_rel_display) else 0
+            history_conn.execute("""
+                INSERT INTO transfer_history_files (
+                    session_token, file_id, relative_path, source_path, save_path, size,
+                    mtime, atime, pre_existed, status, transferred_at
+                ) VALUES (?, 0, ?, ?, ?, 0, ?, ?, ?, 'completed', ?)
+                ON CONFLICT(session_token, relative_path) DO UPDATE SET
+                    save_path = excluded.save_path,
+                    status = 'completed',
+                    transferred_at = COALESCE(transfer_history_files.transferred_at, excluded.transferred_at)
+            """, (
+                token, dir_rel_display, dinfo.get("source_path") or norm_dir,
+                remote_dir_save, dinfo.get("mtime", now_ts), dinfo.get("atime", now_ts),
+                dir_pre, now_ts
+            ))
+
+        for finfo in manifest.get("files", []):
+            norm_rel = normalize_rel_path(finfo["relative_path"])
+            src_full = finfo.get("source_path") or local_mapping.get(norm_rel) or norm_rel
+            m_entry = missing_map.get(norm_rel)
+            remote_save = (m_entry.get("save_path") if m_entry else None) or format_remote_save_path(remote_dest_dir, norm_rel, c_os)
+            pre_ex = 1 if (m_entry.get("pre_existed") if m_entry else pre_existed_map.get(norm_rel, 0)) else 0
+
+            cur = db_conn.execute(
+                """INSERT INTO files (session_token, relative_path, source_path, save_path, size, mtime, atime, pre_existed)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (token, norm_rel, src_full, remote_save, finfo["size"], finfo["mtime"], finfo["atime"], pre_ex)
+            )
+            srv_file_id = cur.lastrowid
+            if m_entry is not None:
+                m_entry["server_file_id"] = srv_file_id
+
+            total_f_chunks = 1 if finfo["size"] == 0 else max(1, math.ceil(finfo["size"] / CHUNK_SIZE))
+            missing_set = set(m_entry.get("missing", [])) if m_entry else set()
+
+            for idx in range(total_f_chunks):
+                c_stat = 'pending' if idx in missing_set else 'received'
+                db_conn.execute(
+                    "INSERT INTO chunks (file_id, chunk_index, status) VALUES (?, ?, ?)",
+                    (srv_file_id, idx, c_stat)
+                )
+
+            is_done = (norm_rel in already_completed) or (len(missing_set) == 0)
+            f_status = 'completed' if is_done else 'pending'
+            done_ts = now_ts if is_done else None
+
+            history_conn.execute("""
+                INSERT INTO transfer_history_files (
+                    session_token, file_id, relative_path, source_path, save_path, size,
+                    mtime, atime, pre_existed, status, transferred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_token, relative_path) DO UPDATE SET
+                    file_id = excluded.file_id,
+                    source_path = excluded.source_path,
+                    save_path = excluded.save_path,
+                    pre_existed = excluded.pre_existed,
+                    status = CASE WHEN transfer_history_files.status = 'completed' THEN 'completed' ELSE excluded.status END,
+                    transferred_at = COALESCE(transfer_history_files.transferred_at, excluded.transferred_at)
+            """, (
+                token, srv_file_id, norm_rel, src_full, remote_save, finfo["size"],
+                finfo["mtime"], finfo["atime"], pre_ex, f_status, done_ts
+            ))
+
+        comp_f, tot_f, recv_c, tot_c = sync_session_metrics(
+            token, override_status='completed' if not missing_map else 'active'
+        )
+
+    num_files = len(manifest.get("files", []))
+    num_dirs = len(manifest.get("dirs", []))
+    with console_print_lock:
+        print(
+            f"\n[*] PUSH Session '{sess_title}' ({token[:8]}) -> Client {c_name} ({c_ip}) [{c_os.upper()}]\n"
+            f"    Files: {num_files} ({format_bytes_human(manifest.get('total_bytes', 0))}) | "
+            f"Empty Folders: {num_dirs} | Client Dest: {remote_dest_dir}"
+        )
+
+    if not missing_map:
+        set_meta('transfer_state', 'completed')
+        finalize_db_wal()
+        with console_print_lock:
+            print(f"[*] PUSH Session '{sess_title}' ({token[:8]}) COMPLETED (all items up-to-date on client).")
+        return
+
+    with push_transfer_lock:
+        push_transfer_active = True
+        push_work_queue = queue.Queue(maxsize=20)
+        threading.Thread(
+            target=process_and_compress_push_chunks,
+            args=(local_mapping, manifest, push_work_queue, missing_map),
+            daemon=True
+        ).start()
+
+    # Notify client that the server's push_work_queue is ready for the 4 push_worker_auth connections
+    send_control_command({
+        "action": "start_push_workers",
+        "session_token": token
+    })
+
+
+def handle_push_worker_stream(conn, worker_session_token):
+    """Stream compressed chunks from server's push_work_queue to a client push_worker_auth socket."""
+    global push_transfer_active, push_work_queue
+    with worker_conn_lock:
+        active_worker_connections.add(conn)
+    try:
+        while server_running and push_transfer_active:
+            if push_work_queue is None:
+                break
+            try:
+                chunk = push_work_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if chunk is None:
+                push_work_queue.task_done()
+                # Send zero-length sentinel header so client worker knows stream finished cleanly
+                try:
+                    conn.sendall(struct.pack('!II', 0, 0))
+                except Exception:
+                    pass
+                break
+
+            meta = {
+                "file_id": chunk["client_file_id"],
+                "chunk_index": chunk["chunk_index"],
+                "comp": "zstd" if HAS_ZSTD else "zlib"
+            }
+            meta_bytes = json.dumps(meta).encode('utf-8')
+            chunk_data = chunk["data"]
+
+            header = struct.pack('!II', len(meta_bytes), len(chunk_data))
+            conn.sendall(header + meta_bytes + chunk_data)
+
+            ack_msg = recv_json_line(conn)
+            push_work_queue.task_done()
+            if not ack_msg or not isinstance(ack_msg, dict):
+                break
+
+            srv_file_id = chunk.get("server_file_id")
+            chunk_idx = chunk["chunk_index"]
+            rel_p = ack_msg.get("relative_path") or chunk.get("relative_path", "")
+            f_size = ack_msg.get("file_size", chunk.get("file_size", 0))
+            file_done = bool(ack_msg.get("file_completed", False))
+            sess_done = bool(ack_msg.get("session_completed", False))
+            done_ts = ack_msg.get("transferred_at") or time.time()
+
+            with db_lock:
+                if srv_file_id:
+                    db_conn.execute(
+                        "UPDATE chunks SET status='received' WHERE file_id=? AND chunk_index=?",
+                        (srv_file_id, chunk_idx)
+                    )
+                if file_done:
+                    history_conn.execute("""
+                        UPDATE transfer_history_files
+                        SET status = 'completed', transferred_at = ?
+                        WHERE session_token = ? AND relative_path = ?
+                    """, (done_ts, worker_session_token, rel_p))
+
+                cursor = db_conn.execute("""
+                    SELECT COUNT(*) FROM chunks c
+                    INNER JOIN files f ON c.file_id = f.file_id
+                    WHERE f.session_token = ? AND c.status = 'pending'
+                """, (worker_session_token,))
+                total_pending = cursor.fetchone()[0] or 0
+                if total_pending == 0 or sess_done:
+                    set_meta('transfer_state', 'completed')
+                    comp_f, tot_f, recv_c, tot_c = sync_session_metrics(worker_session_token, override_status='completed')
+                    all_done = True
+                else:
+                    comp_f, tot_f, recv_c, tot_c = sync_session_metrics(worker_session_token)
+                    all_done = False
+
+            if file_done:
+                pct = round((recv_c / tot_c * 100), 1) if tot_c else 100.0
+                c_name = (connected_client_info or {}).get("hostname", "Client")
+                c_ip = (connected_client_info or {}).get("ip", "")
+                with console_print_lock:
+                    print(
+                        f"[{format_ts_human(done_ts)}] ➡ Pushed {rel_p} ({format_bytes_human(f_size)}) "
+                        f"[{comp_f}/{tot_f} files | {pct}%] -> Client {c_name} ({c_ip})"
+                    )
+
+            if all_done:
+                finalize_db_wal()
+                with console_print_lock:
+                    print(f"[*] PUSH Session {worker_session_token[:8]} completed! WAL checkpointed and cleaned up.")
+    except Exception:
+        pass
+    finally:
+        with worker_conn_lock:
+            active_worker_connections.discard(conn)
 
 
 # ==============================================================================
@@ -902,7 +1406,6 @@ def send_udp_probe():
         "discovery_port": DISCOVERY_UDP_PORT
     }).encode('utf-8')
 
-    # Send across global broadcast, loopback, every NIC's x.x.x.255 subnet broadcast, and known client IPs
     targets = set(get_broadcast_targets())
     with waiting_clients_lock:
         for v in waiting_clients.values():
@@ -946,7 +1449,6 @@ def invite_waiting_client(client_ip, invite_port=DEFAULT_CLIENT_INVITE_PORT, udp
         "password_hash": password_hash or ""
     }
 
-    # 1. Try TCP Invite to the client's invite listener port first (gives immediate auth verification)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(3.0)
@@ -964,7 +1466,6 @@ def invite_waiting_client(client_ip, invite_port=DEFAULT_CLIENT_INVITE_PORT, udp
     except Exception:
         pass
 
-    # 2. Fallback: Send UDP Invite to client's UDP port & probe port if TCP port was filtered
     raw_msg = (json.dumps(invite_payload) + "\n").encode('utf-8')
     udp_sent = False
     for uport in filter(None, [udp_port, CLIENT_PROBE_UDP_PORT]):
@@ -1085,7 +1586,6 @@ def api_connect_client():
         except Exception:
             pass
 
-    # If we know this client requires a password and the user hasn't entered one yet, tell the UI to prompt
     if requires_password and not raw_password and not provided_hash:
         return jsonify({
             "status": "password_required",
@@ -1095,14 +1595,12 @@ def api_connect_client():
 
     pwd_hash = provided_hash if provided_hash is not None else hash_password(raw_password)
 
-    # Register expected password hash for the upcoming handshake
     with auth_state_lock:
         active_client_password_hash = pwd_hash
         pending_client_password_hashes[ip] = pwd_hash
         if client_id:
             pending_client_password_hashes[client_id] = pwd_hash
 
-    # If switching from a previously connected client, disconnect the old control channel cleanly first
     with control_socket_lock:
         if global_control_socket is not None:
             try:
@@ -1127,7 +1625,6 @@ def api_connect_client():
     if invite_status == "unreachable":
         return jsonify({"status": "error", "message": invite_msg})
 
-    # Wait up to 3.5 seconds for the invited client to complete its control_auth connection
     for _ in range(35):
         if global_control_socket is not None and connected_client_info and peer_connection_seq > prev_seq:
             return jsonify({
@@ -1186,11 +1683,12 @@ def browse_local():
 
 @app.route('/api/remote/browse', methods=['POST'])
 def browse_remote():
-    global last_dir_result
+    global last_dir_result, REMOTE_ACTIVE_DIRECTORY
     if not is_client_connected() or global_control_socket is None:
         return jsonify({"status": "error", "message": "Remote client offline."})
 
-    target_path = (request.json or {}).get('path', '')
+    req_data = request.json or {}
+    target_path = req_data.get('path', '')
     dir_result_event.clear()
     last_dir_result = None
 
@@ -1198,16 +1696,18 @@ def browse_remote():
         return jsonify({"status": "error", "message": "Lost control connection to client."})
 
     if dir_result_event.wait(timeout=5.0) and last_dir_result is not None:
+        if last_dir_result.get("status") == "success" and last_dir_result.get("current_path") and last_dir_result.get("current_path") != "DRIVES":
+            REMOTE_ACTIVE_DIRECTORY = last_dir_result["current_path"]
         return jsonify(last_dir_result)
     return jsonify({"status": "error", "message": "Timeout waiting for remote device response."})
 
 
 @app.route('/api/sessions', methods=['GET'])
 def api_get_sessions():
-    """Return all transfer sessions stored in transfer_history.db with Server & Client identification."""
+    """Return all transfer sessions stored in transfer_history.db with Direction, Server & Client identification."""
     with db_lock:
         rows = history_conn.execute("""
-            SELECT session_token, title,
+            SELECT session_token, title, direction,
                    server_name, server_ip, server_os,
                    client_id, client_name, client_ip, client_os,
                    source_paths, destination_path, started_at, updated_at, completed_at,
@@ -1220,38 +1720,40 @@ def api_get_sessions():
     default_srv_ip = get_primary_local_ip()
     sessions = []
     for r in rows:
-        total_c = r[18] or 0
-        recv_c = r[19] or 0
-        status = r[20] or 'idle'
+        direction = (r[2] or 'pull').lower()
+        total_c = r[19] or 0
+        recv_c = r[20] or 0
+        status = r[21] or 'idle'
         pct = round((recv_c / total_c * 100), 1) if total_c > 0 else (100.0 if status == 'completed' else 0.0)
         try:
-            src_paths = json.loads(r[9] or '[]')
+            src_paths = json.loads(r[10] or '[]')
         except Exception:
             src_paths = []
 
         can_resume = status in ('paused', 'interrupted') and (total_c > 0 and recv_c < total_c)
         can_cancel = status in ('active', 'paused', 'interrupted') and (recv_c < total_c)
-        can_rollback = status in ('active', 'paused', 'interrupted', 'completed', 'cancelled') and ((r[15] or 0) > 0 or recv_c > 0)
+        can_rollback = status in ('active', 'paused', 'interrupted', 'completed', 'cancelled') and ((r[16] or 0) > 0 or recv_c > 0)
 
         sessions.append({
             "session_token": r[0],
             "title": r[1] or "Transfer Session",
-            "server_name": r[2] or LOCAL_HOSTNAME,
-            "server_ip": r[3] or default_srv_ip,
-            "server_os": r[4] or LOCAL_OS,
-            "client_id": r[5] or "",
-            "client_name": r[6] or "Remote Device",
-            "client_ip": r[7] or "",
-            "client_os": r[8] or "",
+            "direction": direction,
+            "server_name": r[3] or LOCAL_HOSTNAME,
+            "server_ip": r[4] or default_srv_ip,
+            "server_os": r[5] or LOCAL_OS,
+            "client_id": r[6] or "",
+            "client_name": r[7] or "Remote Device",
+            "client_ip": r[8] or "",
+            "client_os": r[9] or "",
             "source_paths": src_paths,
-            "destination_path": r[10] or SAVE_DIRECTORY,
-            "started_at": r[11],
-            "updated_at": r[12],
-            "completed_at": r[13],
-            "total_files": r[14] or 0,
-            "completed_files": r[15] or 0,
-            "total_bytes": r[16] or 0,
-            "transferred_bytes": r[17] or 0,
+            "destination_path": r[11] or (REMOTE_ACTIVE_DIRECTORY if direction == 'push' else SAVE_DIRECTORY),
+            "started_at": r[12],
+            "updated_at": r[13],
+            "completed_at": r[14],
+            "total_files": r[15] or 0,
+            "completed_files": r[16] or 0,
+            "total_bytes": r[17] or 0,
+            "transferred_bytes": r[18] or 0,
             "total_chunks": total_c,
             "received_chunks": recv_c,
             "percent": pct,
@@ -1265,10 +1767,10 @@ def api_get_sessions():
 
 @app.route('/api/sessions/<session_token>', methods=['GET'])
 def api_get_session_detail(session_token):
-    """Return full metadata (Server + Client identification) and file history for a specific session."""
+    """Return full metadata (Direction + Server + Client identification) and file history for a specific session."""
     with db_lock:
         r = history_conn.execute("""
-            SELECT session_token, title,
+            SELECT session_token, title, direction,
                    server_name, server_ip, server_os,
                    client_id, client_name, client_ip, client_os,
                    source_paths, destination_path, started_at, updated_at, completed_at,
@@ -1298,12 +1800,13 @@ def api_get_session_detail(session_token):
             chunk_progress[fid] = (tot or 0, done or 0)
 
     default_srv_ip = get_primary_local_ip()
-    total_c = r[18] or 0
-    recv_c = r[19] or 0
-    status = r[20] or 'idle'
+    direction = (r[2] or 'pull').lower()
+    total_c = r[19] or 0
+    recv_c = r[20] or 0
+    status = r[21] or 'idle'
     pct = round((recv_c / total_c * 100), 1) if total_c > 0 else (100.0 if status == 'completed' else 0.0)
     try:
-        src_paths = json.loads(r[9] or '[]')
+        src_paths = json.loads(r[10] or '[]')
     except Exception:
         src_paths = []
 
@@ -1317,7 +1820,7 @@ def api_get_session_detail(session_token):
             "file_id": fid,
             "relative_path": fr[2],
             "source_path": fr[3] or fr[2],
-            "name": os.path.basename(fr[2]),
+            "name": os.path.basename(fr[2].rstrip('/')),
             "save_path": fr[4],
             "size": fr[5] or 0,
             "mtime": fr[6],
@@ -1337,22 +1840,23 @@ def api_get_session_detail(session_token):
     session_obj = {
         "session_token": r[0],
         "title": r[1] or "Transfer Session",
-        "server_name": r[2] or LOCAL_HOSTNAME,
-        "server_ip": r[3] or default_srv_ip,
-        "server_os": r[4] or LOCAL_OS,
-        "client_id": r[5] or "",
-        "client_name": r[6] or "Remote Device",
-        "client_ip": r[7] or "",
-        "client_os": r[8] or "",
+        "direction": direction,
+        "server_name": r[3] or LOCAL_HOSTNAME,
+        "server_ip": r[4] or default_srv_ip,
+        "server_os": r[5] or LOCAL_OS,
+        "client_id": r[6] or "",
+        "client_name": r[7] or "Remote Device",
+        "client_ip": r[8] or "",
+        "client_os": r[9] or "",
         "source_paths": src_paths,
-        "destination_path": r[10] or SAVE_DIRECTORY,
-        "started_at": r[11],
-        "updated_at": r[12],
-        "completed_at": r[13],
-        "total_files": r[14] or 0,
-        "completed_files": r[15] or 0,
-        "total_bytes": r[16] or 0,
-        "transferred_bytes": r[17] or 0,
+        "destination_path": r[11] or (REMOTE_ACTIVE_DIRECTORY if direction == 'push' else SAVE_DIRECTORY),
+        "started_at": r[12],
+        "updated_at": r[13],
+        "completed_at": r[14],
+        "total_files": r[15] or 0,
+        "completed_files": r[16] or 0,
+        "total_bytes": r[17] or 0,
+        "transferred_bytes": r[18] or 0,
         "total_chunks": total_c,
         "received_chunks": recv_c,
         "percent": pct,
@@ -1367,7 +1871,7 @@ def api_get_session_detail(session_token):
 
 @app.route('/api/action', methods=['POST'])
 def api_action():
-    global SAVE_DIRECTORY, current_active_token
+    global SAVE_DIRECTORY, REMOTE_ACTIVE_DIRECTORY, current_active_token
     data = request.json or {}
     cmd = data.get("action")
     req_token = data.get("session_token")
@@ -1387,13 +1891,30 @@ def api_action():
     if not global_control_socket:
         return jsonify({"status": "error", "message": "Remote client is not connected."})
 
-    if cmd == "start_transfer":
+    # 1. PULL Transfer (Client -> Server) or unified start_transfer with direction
+    if cmd in ("start_transfer", "start_pull_transfer", "start_push_transfer"):
+        direction = (data.get("direction") or ("push" if cmd == "start_push_transfer" else "pull")).lower()
         paths = data.get("paths", [])
-        local_dest = data.get("dest_path", "").strip()
-        if local_dest and local_dest != "DRIVES" and os.path.isdir(local_dest):
-            SAVE_DIRECTORY = os.path.abspath(local_dest)
         if not paths:
             return jsonify({"status": "error", "message": "No source files or directories selected."})
+
+        if direction == "push":
+            remote_dest = (data.get("remote_dest_path") or data.get("dest_path") or REMOTE_ACTIVE_DIRECTORY or "").strip()
+            if remote_dest == "DRIVES":
+                return jsonify({"status": "error", "message": "Cannot push files directly into DRIVES root. Open a folder on the client first."})
+            if remote_dest:
+                REMOTE_ACTIVE_DIRECTORY = remote_dest
+            new_token = secrets.token_hex(16)
+            if start_push_session_on_server(new_token, paths, REMOTE_ACTIVE_DIRECTORY, is_resume=False):
+                return jsonify({"status": "success", "state": "active", "direction": "push", "session_token": new_token})
+            return jsonify({"status": "error", "message": "Failed to send push transfer command to client."})
+
+        # Default: PULL (Client -> Server)
+        local_dest = (data.get("dest_path") or "").strip()
+        if local_dest == "DRIVES":
+            return jsonify({"status": "error", "message": "Cannot save files directly into DRIVES root. Open a local drive/folder first."})
+        if local_dest and os.path.isdir(local_dest):
+            SAVE_DIRECTORY = os.path.abspath(local_dest)
 
         new_token = secrets.token_hex(16)
         now = time.time()
@@ -1414,13 +1935,13 @@ def api_action():
 
             history_conn.execute("""
                 INSERT OR REPLACE INTO transfer_sessions (
-                    session_token, title,
+                    session_token, title, direction,
                     server_name, server_ip, server_os,
                     client_id, client_name, client_ip, client_os,
                     source_paths, destination_path, started_at, updated_at,
                     total_files, completed_files, total_bytes, transferred_bytes,
                     total_chunks, received_chunks, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 'active')
+                ) VALUES (?, ?, 'pull', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, 0, 'active')
             """, (
                 new_token, title,
                 LOCAL_HOSTNAME, srv_ip, LOCAL_OS,
@@ -1430,6 +1951,7 @@ def api_action():
 
         if send_control_command({
             "action": "start_transfer",
+            "direction": "pull",
             "paths": paths,
             "session_token": new_token,
             "session_title": title,
@@ -1438,9 +1960,10 @@ def api_action():
             "server_ip": srv_ip,
             "server_os": LOCAL_OS
         }):
-            return jsonify({"status": "success", "state": "active", "session_token": new_token})
+            return jsonify({"status": "success", "state": "active", "direction": "pull", "session_token": new_token})
         return jsonify({"status": "error", "message": "Failed to send start command to client."})
 
+    # 2. Resume Incomplete Session (Works for both PULL and PUSH)
     if cmd == "resume_transfer":
         target_token = req_token or get_meta('session_token')
         if not target_token:
@@ -1448,7 +1971,7 @@ def api_action():
 
         with db_lock:
             row = history_conn.execute(
-                "SELECT source_paths, destination_path, status, title FROM transfer_sessions WHERE session_token=?",
+                "SELECT source_paths, destination_path, status, title, direction FROM transfer_sessions WHERE session_token=?",
                 (target_token,)
             ).fetchone()
             if not row:
@@ -1460,11 +1983,18 @@ def api_action():
                 paths = json.loads(row[0] or '[]')
             except Exception:
                 paths = []
-            dest_dir = row[1] or SAVE_DIRECTORY
+            dest_dir = row[1] or ""
             title = row[3] or make_session_title(paths)
+            direction = (row[4] or 'pull').lower()
+
+        if direction == 'push':
+            if start_push_session_on_server(target_token, paths, dest_dir, is_resume=True):
+                return jsonify({"status": "success", "state": "active", "direction": "push", "session_token": target_token})
+            return jsonify({"status": "error", "message": "Failed to resume PUSH transfer with client."})
+
+        with db_lock:
             if dest_dir and os.path.isdir(dest_dir):
                 SAVE_DIRECTORY = dest_dir
-
             srv_ip = (connected_client_info or {}).get("server_ip") or get_primary_local_ip()
             active_sessions.add(target_token)
             current_active_token = target_token
@@ -1479,6 +2009,7 @@ def api_action():
 
         if send_control_command({
             "action": "start_transfer",
+            "direction": "pull",
             "paths": paths,
             "session_token": target_token,
             "session_title": title,
@@ -1488,7 +2019,7 @@ def api_action():
             "server_os": LOCAL_OS,
             "resume": True
         }):
-            return jsonify({"status": "success", "state": "active", "session_token": target_token})
+            return jsonify({"status": "success", "state": "active", "direction": "pull", "session_token": target_token})
         return jsonify({"status": "error", "message": "Failed to send resume command to client."})
 
     return jsonify({"status": "error", "message": f"Unknown action: {cmd}"})
@@ -1499,6 +2030,7 @@ def get_progress():
     global current_active_token
     try:
         req_token = request.args.get('session_token') or current_active_token or get_meta('session_token')
+        direction = 'pull'
         with db_lock:
             if req_token:
                 cursor = db_conn.execute("""
@@ -1519,10 +2051,11 @@ def get_progress():
             state = get_meta('transfer_state', 'idle')
             if req_token:
                 s_row = history_conn.execute(
-                    "SELECT status FROM transfer_sessions WHERE session_token=?", (req_token,)
+                    "SELECT status, direction FROM transfer_sessions WHERE session_token=?", (req_token,)
                 ).fetchone()
                 if s_row:
                     state = s_row[0]
+                    direction = (s_row[1] or 'pull').lower()
 
             if state == 'active' and total_chunks > 0 and pending_chunks == 0:
                 state = 'completed'
@@ -1577,6 +2110,7 @@ def get_progress():
 
         return jsonify({
             "state": state,
+            "direction": direction,
             "active_session_token": req_token or "",
             "server_hostname": LOCAL_HOSTNAME,
             "server_os": LOCAL_OS,
@@ -1586,6 +2120,7 @@ def get_progress():
             "peer_seq": peer_connection_seq,
             "local_os": LOCAL_OS,
             "save_directory": SAVE_DIRECTORY,
+            "remote_directory": REMOTE_ACTIVE_DIRECTORY,
             "percent": round(percent, 1),
             "total": total_chunks,
             "received": received_chunks,
@@ -1597,7 +2132,7 @@ def get_progress():
         })
     except Exception as e:
         return jsonify({
-            "state": "idle", "client_online": False, "percent": 0, "total": 0,
+            "state": "idle", "direction": "pull", "client_online": False, "percent": 0, "total": 0,
             "received": 0, "active_files": [], "can_resume": False,
             "can_cancel": False, "can_rollback": False, "error": str(e)
         })
@@ -1649,6 +2184,7 @@ def recv_json_line(sock, max_bytes=50 * 1024 * 1024):
 
 
 def handle_worker_stream(conn, worker_session_token):
+    """Receive compressed chunks from client worker socket during a PULL (Client -> Server) transfer."""
     global current_active_token
     dctx = zstd.ZstdDecompressor() if HAS_ZSTD else None
     with worker_conn_lock:
@@ -1740,11 +2276,13 @@ def handle_worker_stream(conn, worker_session_token):
                 except Exception:
                     pass
                 release_file_lock(file_id)
-                print(f"[*] Completed direct-write transfer: {rel_path}")
+                with console_print_lock:
+                    print(f"[*] ⬅ Completed PULL direct-write transfer: {rel_path}")
 
             if all_done:
                 finalize_db_wal()
-                print(f"[*] Session {file_session_token[:8]} completed! WAL checkpointed and cleaned up.")
+                with console_print_lock:
+                    print(f"[*] PULL Session {file_session_token[:8]} completed! WAL checkpointed and cleaned up.")
 
             ack_payload = {
                 "status": "ack",
@@ -1832,11 +2370,19 @@ def handle_client(conn, addr):
                         del buffer[:nl + 1]
                         if line_bytes:
                             msg = json.loads(line_bytes.decode('utf-8'))
-                            if msg.get("action") == "dir_result":
+                            m_act = msg.get("action")
+                            if m_act == "dir_result":
                                 last_dir_result = msg
                                 dir_result_event.set()
-                            elif msg.get("action") == "transfer_interrupted":
+                            elif m_act == "push_manifest_processed":
+                                threading.Thread(
+                                    target=handle_push_manifest_processed,
+                                    args=(msg,),
+                                    daemon=True
+                                ).start()
+                            elif m_act == "transfer_interrupted":
                                 tok = msg.get("session_token") or current_active_token
+                                stop_push_workers()
                                 with db_lock:
                                     set_meta('transfer_state', 'interrupted')
                                     if tok:
@@ -1845,6 +2391,7 @@ def handle_client(conn, addr):
                 except Exception:
                     break
 
+            stop_push_workers()
             with control_socket_lock:
                 if global_control_socket is conn:
                     global_control_socket = None
@@ -1863,13 +2410,22 @@ def handle_client(conn, addr):
             finalize_db_wal()
             return
 
-        # 2. Data Worker Stream Channel
+        # 2A. Data Worker Stream Channel for PULL (Client -> Server)
         if action == "worker_auth":
             tok = payload.get("session_token")
             if tok in active_sessions:
                 conn.settimeout(30.0)
                 conn.sendall(b"success\n")
                 handle_worker_stream(conn, tok)
+            return
+
+        # 2B. Reverse Data Worker Stream Channel for PUSH (Server -> Client)
+        if action == "push_worker_auth":
+            tok = payload.get("session_token")
+            if tok in active_sessions:
+                conn.settimeout(30.0)
+                conn.sendall(b"success\n")
+                handle_push_worker_stream(conn, tok)
             return
 
         # 3. Client-initiated Cancel or Rollback
@@ -1881,7 +2437,7 @@ def handle_client(conn, addr):
             perform_rollback(payload.get("session_token"))
             return
 
-        # 4. Transfer Session Initialization & Manifest Sync
+        # 4. PULL Transfer Session Initialization & Manifest Sync
         if verify_client_password_hash(recv_pwd_hash, client_ip=addr[0], client_id=client_id):
             enable_db_wal()
             req_token = payload.get("session_token")
@@ -1930,11 +2486,11 @@ def handle_client(conn, addr):
                     if not sess_row:
                         history_conn.execute("""
                             INSERT INTO transfer_sessions (
-                                session_token, title,
+                                session_token, title, direction,
                                 server_name, server_ip, server_os,
                                 client_id, client_name, client_ip, client_os,
                                 source_paths, destination_path, started_at, updated_at, status
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, 'active')
+                            ) VALUES (?, ?, 'pull', ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, 'active')
                         """, (
                             token, sess_title,
                             LOCAL_HOSTNAME, routed_srv_ip, LOCAL_OS,
@@ -1944,7 +2500,8 @@ def handle_client(conn, addr):
                     else:
                         history_conn.execute("""
                             UPDATE transfer_sessions
-                            SET server_name = ?, server_ip = ?, server_os = ?,
+                            SET direction = 'pull',
+                                server_name = ?, server_ip = ?, server_os = ?,
                                 client_id = COALESCE(NULLIF(?, ''), client_id),
                                 client_name = COALESCE(NULLIF(?, ''), client_name),
                                 client_ip = COALESCE(NULLIF(?, ''), client_ip),
@@ -1952,7 +2509,6 @@ def handle_client(conn, addr):
                             WHERE session_token = ?
                         """, (LOCAL_HOSTNAME, routed_srv_ip, LOCAL_OS, c_id, c_name, c_ip, c_os, token))
 
-                    # Create and log any empty directories included in the manifest
                     for dir_info in empty_dirs:
                         norm_dir = normalize_rel_path(dir_info.get("relative_path", ""))
                         if not norm_dir:
@@ -2100,7 +2656,7 @@ def handle_client(conn, addr):
 
 
 # ==============================================================================
-# INTERACTIVE TERMINAL UI (TUI) STARTUP MENU & NANO-STYLE HISTORY VIEWER
+# INTERACTIVE TERMINAL UI (TUI) STARTUP MENU & HISTORY VIEWER
 # ==============================================================================
 def format_bytes_human(num_bytes):
     if not num_bytes or num_bytes <= 0:
@@ -2129,7 +2685,7 @@ def clear_terminal():
 
 def read_single_key():
     """
-    Cross-platform single-keypress reader for nano-style terminal navigation.
+    Cross-platform single-keypress reader for terminal navigation.
     Supports Arrow Keys (UP, DOWN, LEFT, RIGHT), PGUP, PGDN, ENTER, BACKSPACE, ESC, and letter keys
     on both Windows (msvcrt) and Linux / Android Termux (termios + tty).
     """
@@ -2174,7 +2730,6 @@ def read_single_key():
             if ch in (b'\x7f', b'\x08'):
                 return 'BACKSPACE'
             if ch == b'\x1b':
-                # Check for escape sequence (arrow keys)
                 rlist, _, _ = select.select([fd], [], [], 0.08)
                 if rlist:
                     seq = os.read(fd, 3)
@@ -2208,7 +2763,7 @@ def interactive_history_viewer():
 
         with db_lock:
             sessions = history_conn.execute("""
-                SELECT session_token, title,
+                SELECT session_token, title, direction,
                        server_name, server_ip, server_os,
                        client_id, client_name, client_ip, client_os,
                        source_paths, destination_path, started_at, updated_at, completed_at,
@@ -2224,7 +2779,7 @@ def interactive_history_viewer():
 
         if viewing_session_token is None:
             print(border)
-            print(" ⚡ EFT SERVER — NANO-STYLE TRANSFER HISTORY VIEWER (transfer_history.db)")
+            print(" ⚡ EFT v3.0 SERVER — TRANSFER HISTORY VIEWER (transfer_history.db)")
             print(border)
 
             if not sessions:
@@ -2243,30 +2798,33 @@ def interactive_history_viewer():
 
             print(f" Showing Sessions {start_idx + 1}-{end_idx} of {len(sessions)}:")
             print("-" * min(term_cols - 1, 115))
-            header_fmt = f" {'#':<3} | {'STATUS':<11} | {'TITLE':<20} | {'FILES':<9} | {'DATA SIZE':<11} | {'CLIENT (NAME / IP / OS)':<28} | {'STARTED AT':<19}"
+            header_fmt = f" {'#':<3} | {'DIR':<6} | {'STATUS':<11} | {'TITLE':<18} | {'FILES':<9} | {'DATA SIZE':<10} | {'CLIENT (NAME / IP / OS)':<25} | {'STARTED AT':<19}"
             print(header_fmt[:term_cols - 1])
             print("-" * min(term_cols - 1, 115))
 
             for idx in range(start_idx, end_idx):
                 s = sessions[idx]
                 marker = "▶" if idx == selected_idx else " "
-                status_str = (s[20] or 'idle').upper()[:11]
-                title_str = (s[1] or 'Session')[:20]
-                files_str = f"{s[15] or 0}/{s[14] or 0}"
-                size_str = format_bytes_human(s[16] or 0)
-                c_peer = f"{s[6] or 'Client'} ({s[7] or '?'}) [{(s[8] or '?').upper()}]"[:28]
-                started_str = format_ts_human(s[11])
-                line = f"{marker}{idx + 1:<3} | {status_str:<11} | {title_str:<20} | {files_str:<9} | {size_str:<11} | {c_peer:<28} | {started_str:<19}"
+                dir_str = "➡ PUSH" if (s[2] or 'pull').lower() == 'push' else "⬅ PULL"
+                status_str = (s[21] or 'idle').upper()[:11]
+                title_str = (s[1] or 'Session')[:18]
+                files_str = f"{s[16] or 0}/{s[15] or 0}"
+                size_str = format_bytes_human(s[17] or 0)
+                c_peer = f"{s[7] or 'Client'} ({s[8] or '?'}) [{(s[9] or '?').upper()}]"[:25]
+                started_str = format_ts_human(s[12])
+                line = f"{marker}{idx + 1:<3} | {dir_str:<6} | {status_str:<11} | {title_str:<18} | {files_str:<9} | {size_str:<10} | {c_peer:<25} | {started_str:<19}"
                 if idx == selected_idx:
                     print(f"\033[7m{line[:term_cols - 1]}\033[0m")
                 else:
                     print(line[:term_cols - 1])
 
             s_cur = sessions[selected_idx]
+            cur_dir = (s_cur[2] or 'pull').upper()
+            flow_str = "Server ➔ Client (PUSH)" if cur_dir == 'PUSH' else "Client ➔ Server (PULL)"
             print("-" * min(term_cols - 1, 115))
-            print(f" Selected Session ID : {s_cur[0]}")
-            print(f" Server Peer         : {s_cur[2] or LOCAL_HOSTNAME} ({s_cur[3] or get_primary_local_ip()}) [{(s_cur[4] or LOCAL_OS).upper()}]")
-            print(f" Client Peer         : {s_cur[6] or 'Client'} ({s_cur[7] or 'N/A'}) [{(s_cur[8] or 'unknown').upper()}] | Dest: {s_cur[10] or SAVE_DIRECTORY}")
+            print(f" Selected Session ID : {s_cur[0]}  [{flow_str}]")
+            print(f" Server Peer         : {s_cur[3] or LOCAL_HOSTNAME} ({s_cur[4] or get_primary_local_ip()}) [{(s_cur[5] or LOCAL_OS).upper()}]")
+            print(f" Client Peer         : {s_cur[7] or 'Client'} ({s_cur[8] or 'N/A'}) [{(s_cur[9] or 'unknown').upper()}] | Dest: {s_cur[11] or SAVE_DIRECTORY}")
             print(border)
             print(" Controls: [↑/↓] Select Session  [←/→] Page  [Enter] Inspect Transferred Files  [q/Esc] Back to Menu")
             print(border)
@@ -2289,7 +2847,7 @@ def interactive_history_viewer():
         else:
             with db_lock:
                 s_row = history_conn.execute("""
-                    SELECT session_token, title,
+                    SELECT session_token, title, direction,
                            server_name, server_ip, server_os,
                            client_id, client_name, client_ip, client_os,
                            source_paths, destination_path, started_at, updated_at, completed_at,
@@ -2311,15 +2869,17 @@ def interactive_history_viewer():
                 viewing_session_token = None
                 continue
 
+            dir_mode = (s_row[2] or 'pull').upper()
+            flow_label = "SERVER ➔ CLIENT (PUSH)" if dir_mode == 'PUSH' else "CLIENT ➔ SERVER (PULL)"
             print(border)
-            print(f" 📂 SESSION INSPECTOR: {s_row[1]}  [{(s_row[20] or 'idle').upper()}]")
+            print(f" 📂 SESSION INSPECTOR: {s_row[1]}  [{flow_label} | {(s_row[21] or 'idle').upper()}]")
             print(border)
             print(f" Session Token  : {s_row[0]}")
-            print(f" Server Host    : {s_row[2] or LOCAL_HOSTNAME} | IP: {s_row[3] or get_primary_local_ip()} | OS: {(s_row[4] or LOCAL_OS).upper()}")
-            print(f" Client Device  : {s_row[6] or 'Remote'} | IP: {s_row[7] or 'N/A'} | OS: {(s_row[8] or 'unknown').upper()} | ID: {s_row[5] or 'N/A'}")
-            print(f" Destination    : {s_row[10] or SAVE_DIRECTORY}")
-            print(f" Started / Done : {format_ts_human(s_row[11])}  -->  {format_ts_human(s_row[13] or s_row[12])}")
-            print(f" Progress       : {s_row[15] or 0}/{s_row[14] or 0} Files | {format_bytes_human(s_row[17] or 0)} / {format_bytes_human(s_row[16] or 0)} ({s_row[19] or 0}/{s_row[18] or 0} Chunks)")
+            print(f" Server Host    : {s_row[3] or LOCAL_HOSTNAME} | IP: {s_row[4] or get_primary_local_ip()} | OS: {(s_row[5] or LOCAL_OS).upper()}")
+            print(f" Client Device  : {s_row[7] or 'Remote'} | IP: {s_row[8] or 'N/A'} | OS: {(s_row[9] or 'unknown').upper()} | ID: {s_row[6] or 'N/A'}")
+            print(f" Destination    : {s_row[11] or SAVE_DIRECTORY}")
+            print(f" Started / Done : {format_ts_human(s_row[12])}  -->  {format_ts_human(s_row[14] or s_row[13])}")
+            print(f" Progress       : {s_row[16] or 0}/{s_row[15] or 0} Files | {format_bytes_human(s_row[18] or 0)} / {format_bytes_human(s_row[17] or 0)} ({s_row[20] or 0}/{s_row[19] or 0} Chunks)")
             print("-" * min(term_cols - 1, 115))
 
             file_page_size = max(4, term_rows - 15)
@@ -2330,7 +2890,7 @@ def interactive_history_viewer():
                 f_start = (file_scroll_idx // file_page_size) * file_page_size
                 f_end = min(len(f_rows), f_start + file_page_size)
 
-                f_hdr = f" {'#':<4} | {'CLIENT RELATIVE PATH (SOURCE)':<44} | {'SIZE':<10} | {'STATUS':<11} | {'TRANSFERRED AT':<19}"
+                f_hdr = f" {'#':<4} | {'RELATIVE PATH':<44} | {'SIZE':<10} | {'STATUS':<11} | {'TRANSFERRED AT':<19}"
                 print(f_hdr[:term_cols - 1])
                 print("-" * min(term_cols - 1, 115))
 
@@ -2351,8 +2911,12 @@ def interactive_history_viewer():
 
                 cur_f = f_rows[file_scroll_idx]
                 print("-" * min(term_cols - 1, 115))
-                print(f" Client Source Path   : {cur_f[1] or cur_f[0]}")
-                print(f" Server Saved Path    : {cur_f[2]}")
+                if dir_mode == 'PUSH':
+                    print(f" Server Source Path   : {cur_f[1] or cur_f[0]}")
+                    print(f" Client Saved Path    : {cur_f[2]}")
+                else:
+                    print(f" Client Source Path   : {cur_f[1] or cur_f[0]}")
+                    print(f" Server Saved Path    : {cur_f[2]}")
 
             print(border)
             print(" Controls: [↑/↓] Scroll Files  [←/→] Page  [b / Backspace / Esc] Back to Sessions  [q] Main Menu")
@@ -2371,6 +2935,8 @@ def interactive_history_viewer():
                 viewing_session_token = None
             elif key == 'q':
                 break
+
+
 last_sigint_ts = 0.0
 
 
@@ -2424,7 +2990,7 @@ def start_server():
 
     ips_str = ", ".join(get_local_ips())
     print("\n" + "=" * 78)
-    print(f"[*] EFT High-Speed Server v2.4 online ({LOCAL_OS.upper()} - {LOCAL_HOSTNAME})")
+    print(f"[*] EFT Two-Way High-Speed Server v3.0 online ({LOCAL_OS.upper()} - {LOCAL_HOSTNAME})")
     print(f"[*] Server Local IPs : {ips_str}")
     print(f"[*] Socket Port      : {PORT} | Web UI: http://127.0.0.1:{WEB_PORT}")
     print(f"[*] Client curl URL  : curl http://{get_primary_local_ip()}:{WEB_PORT}/download/client.py -o client.py")
@@ -2456,17 +3022,17 @@ def start_server():
 
 
 def run_startup_menu():
-    """Interactive numerical startup menu for EFT Server v2.4."""
+    """Interactive numerical startup menu for EFT Server v3.0."""
     if "--no-menu" in sys.argv:
         start_server()
         return
 
     while True:
         print("\n" + "=" * 68)
-        print(f" ⚡ EFFICIENT FILE TRANSFER (EFT) v2.4 — SERVER ({LOCAL_HOSTNAME} | {LOCAL_OS.upper()})")
+        print(f" ⚡ EFFICIENT FILE TRANSFER (EFT) v3.0 — SERVER ({LOCAL_HOSTNAME} | {LOCAL_OS.upper()})")
         print("=" * 68)
-        print("  1. Start EFT Server (Engine + Web UI on port 8081)")
-        print("  2. Read Old Transfer History (Nano-Style Arrow-Key Viewer)")
+        print("  1. Start EFT Server (Two-Way Engine + Web UI on port 8081)")
+        print("  2. Read Old Transfer History (Arrow-Key Viewer)")
         print("  3. Exit")
         print("-" * 68)
         try:
