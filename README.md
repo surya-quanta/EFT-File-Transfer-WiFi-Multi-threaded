@@ -13,7 +13,7 @@ By combining **5 MB direct-write disk pre-allocation**, a **bounded producer-con
 ---
 
 ## 📑 Table of Contents
-1. [📊 Real-World Benchmark: Wi-Fi 6 EFT vs. USB MTP](#-1-real-world-benchmark-wi-fi-6-eft-vs-usb-mtp)
+1. [📊 Real-World Benchmark: Wi-Fi 5 EFT vs. USB MTP](#-1-real-world-benchmark-wi-fi-6-eft-vs-usb-mtp)
 2. [✨ Key Features (v3.0)](#-2-key-features-v3.0)
 3. [📸 Visual Tour & Interface Gallery](#-3-visual-tour--interface-gallery)
 4. [🧠 Under the Hood: How EFT Works](#-4-under-the-hood-how-eft-works)
