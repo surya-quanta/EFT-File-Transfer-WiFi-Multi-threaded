@@ -32,7 +32,7 @@ Tested transferring a massive mixed directory (thousands of small source files, 
 
 | Benchmark Metric | Traditional USB MTP / Explorer | 🛜 ⚡ EFT Engine v4 (Wi-Fi 6) | Engineering Gain |
 | :--- | :--- | :--- | :--- |
-| **Workload Dataset** | 10,735 Files across 77 Folders | 10,735 Files across 77 Folders | **Identical Workload** |
+| **Workload Dataset** | 10,735 Files across 77 Folders (~1MB each) | 10,735 Files across 77 Folders | **Identical Workload** |
 | **Total Data Volume** | 4.60 GB (`4,947,399,050` bytes) | 4.60 GB (`4,947,399,050` bytes) | **100% Byte Parity** |
 | **Total Elapsed Time** | ~8.5 Hours *(Projected)* | **2 Minutes 00 Seconds** | **~255x Faster** |
 | **Sustained Throughput** | < 1.5 Mbps *(Stalls on small files)* | **363 Mbps (~45.4 MB/s)** | **Wire-Speed Saturation** |
