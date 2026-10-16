@@ -24,11 +24,25 @@ except ImportError:
     HAS_ZSTD = False
 
 from flask import Flask, request, jsonify, render_template_string, Response
+from werkzeug.serving import WSGIRequestHandler
 import logging
 
-# Suppress noisy Flask per-second polling logs in console
+# Completely silence Werkzeug 400 Bad Request binary/TLS probe garbage (e.g. \x16\x03 / \x78)
 log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
+log.setLevel(logging.CRITICAL)
+log.disabled = True
+
+
+class QuietWSGIRequestHandler(WSGIRequestHandler):
+    def log_request(self, code='-', size='-'):
+        pass
+
+    def log_error(self, format, *args):
+        pass
+
+    def log_message(self, format, *args):
+        pass
+
 
 HOST = '0.0.0.0'
 PORT = 8080
@@ -81,6 +95,14 @@ def get_primary_local_ip():
             return ip
     return ips[0] if ips else '127.0.0.1'
 
+def get_broadcast_targets():
+    """Return 255.255.255.255, 127.0.0.1, and directed subnet broadcasts (x.x.x.255) for all local NICs."""
+    targets = {'255.255.255.255', '127.0.0.1'}
+    for ip in get_local_ips():
+        parts = ip.split('.')
+        if len(parts) == 4 and not ip.startswith('127.'):
+            targets.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
+    return sorted(targets)
 
 def get_default_save_directory():
     if LOCAL_OS == 'windows':
@@ -576,6 +598,41 @@ def close_active_workers():
         except Exception:
             pass
 
+def disconnect_client_cleanly():
+    """Disconnect the currently connected client so the next Ctrl+C shuts down the server."""
+    global global_control_socket, connected_client_info, last_dir_result
+    send_control_command({"action": "disconnect_control"})
+    close_active_workers()
+    with control_socket_lock:
+        if global_control_socket:
+            try:
+                global_control_socket.close()
+            except Exception:
+                pass
+            global_control_socket = None
+        connected_client_info = None
+    last_dir_result = None
+    dir_result_event.clear()
+
+
+def has_active_incomplete_transfer(session_token=None):
+    """Return True ONLY if there is an actively running transfer with pending chunks."""
+    tok = session_token or current_active_token or get_meta('session_token')
+    if not tok:
+        return False
+    with db_lock:
+        s_row = history_conn.execute(
+            "SELECT status FROM transfer_sessions WHERE session_token=?", (tok,)
+        ).fetchone()
+        if not s_row or s_row[0] != 'active':
+            return False
+        c_row = db_conn.execute("""
+            SELECT COUNT(*) FROM chunks c
+            INNER JOIN files f ON c.file_id = f.file_id
+            WHERE f.session_token = ? AND c.status = 'pending'
+        """, (tok,)).fetchone()
+        return bool(c_row and (c_row[0] or 0) > 0)
+
 
 def cleanup_empty_parent_dirs(file_path, base_dir):
     """Remove empty parent directories created during a transfer without deleting base_dir."""
@@ -603,6 +660,14 @@ def perform_cancel(session_token=None, reason="User cancelled transfer"):
     global current_active_token
     if not session_token:
         session_token = current_active_token or get_meta('session_token')
+    if session_token:
+        with db_lock:
+            st_row = history_conn.execute(
+                "SELECT status FROM transfer_sessions WHERE session_token=?", (session_token,)
+            ).fetchone()
+            if st_row and st_row[0] == 'completed':
+                print(f"[*] Session {session_token[:8]} is already completed; skipping cancel.")
+                return 0
 
     print(f"[*] Executing Cancel ({reason}) for session {session_token}: removing only partial files...")
     send_control_command({"action": "cancel_transfer", "session_token": session_token})
@@ -828,19 +893,40 @@ def discovery_listener_loop():
 
 
 def send_udp_probe():
-    """Broadcast a probe packet so any waiting clients immediately announce themselves."""
+    """Broadcast probe packets across all local NIC subnets so waiting clients on Wi-Fi/Hotspots respond immediately."""
     probe = json.dumps({
         "type": "eft_server_probe",
         "server_hostname": LOCAL_HOSTNAME,
         "server_os": LOCAL_OS,
+        "server_ips": get_local_ips(),
         "discovery_port": DISCOVERY_UDP_PORT
     }).encode('utf-8')
-    for target_ip in ('255.255.255.255', '127.0.0.1'):
+
+    # Send across global broadcast, loopback, every NIC's x.x.x.255 subnet broadcast, and known client IPs
+    targets = set(get_broadcast_targets())
+    with waiting_clients_lock:
+        for v in waiting_clients.values():
+            if v.get("ip"):
+                targets.add(v["ip"])
+            if v.get("source_ip"):
+                targets.add(v["source_ip"])
+
+    for local_ip in get_local_ips():
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.settimeout(0.2)
-            s.sendto(probe, (target_ip, CLIENT_PROBE_UDP_PORT))
+            s.settimeout(0.15)
+            try:
+                if not local_ip.startswith('127.'):
+                    s.bind((local_ip, 0))
+            except Exception:
+                pass
+            for target_ip in targets:
+                for port in (CLIENT_PROBE_UDP_PORT, DEFAULT_CLIENT_INVITE_PORT):
+                    try:
+                        s.sendto(probe, (target_ip, port))
+                    except Exception:
+                        pass
             s.close()
         except Exception:
             pass
@@ -935,7 +1021,12 @@ def api_waiting_clients():
     now = time.time()
     active_list = []
     with waiting_clients_lock:
-        expired = [k for k, v in waiting_clients.items() if now - v['last_seen'] > 12.0]
+        expired = [
+            k for k, v in waiting_clients.items()
+            if (now - v['last_seen'] > 25.0) and not (
+                connected_client_info and connected_client_info.get("client_id") == v.get("client_id")
+            )
+        ]
         for k in expired:
             waiting_clients.pop(k, None)
         for v in waiting_clients.values():
@@ -1513,7 +1604,14 @@ def get_progress():
 
 
 def start_web_server():
-    app.run(host=HOST, port=WEB_PORT, debug=False, use_reloader=False, threaded=True)
+    app.run(
+        host=HOST,
+        port=WEB_PORT,
+        debug=False,
+        use_reloader=False,
+        threaded=True,
+        request_handler=QuietWSGIRequestHandler
+    )
 
 
 # --- SOCKET FRAMING HELPERS ---
@@ -2253,7 +2351,7 @@ def interactive_history_viewer():
 
                 cur_f = f_rows[file_scroll_idx]
                 print("-" * min(term_cols - 1, 115))
-                print(f" Client Relative Path : {cur_f[0]}")
+                print(f" Client Source Path   : {cur_f[1] or cur_f[0]}")
                 print(f" Server Saved Path    : {cur_f[2]}")
 
             print(border)
@@ -2273,6 +2371,38 @@ def interactive_history_viewer():
                 viewing_session_token = None
             elif key == 'q':
                 break
+last_sigint_ts = 0.0
+
+
+def handle_ctrl_c_interrupt():
+    """
+    Smart Ctrl+C handler:
+    - If a client is connected:
+        * If a transfer is actively running with pending chunks -> cancel partial files once.
+        * If the transfer is already completed/idle/paused -> DO NOT overwrite status!
+        * In both cases, disconnect the client immediately so the next Ctrl+C closes the server.
+    - If no client is connected -> shut down the server cleanly.
+    """
+    global server_running, last_sigint_ts
+    now = time.time()
+    if now - last_sigint_ts < 0.8:
+        return
+    last_sigint_ts = now
+
+    if is_client_connected():
+        if has_active_incomplete_transfer(current_active_token):
+            print("\n[!] Ctrl+C detected during active transfer -> Cancelling partial files & disconnecting client...")
+            perform_cancel(
+                session_token=current_active_token,
+                reason="Ctrl+C on server during active transfer"
+            )
+        else:
+            print("\n[*] Ctrl+C detected while client connected (no active transfer in progress) -> Disconnecting client...")
+        disconnect_client_cleanly()
+        print("[*] Client disconnected. Press Ctrl+C again to shut down the server.")
+    else:
+        print("\n[*] Ctrl+C detected with no client connected -> Shutting down server and cleaning up WAL files...")
+        server_running = False
 
 
 def start_server():
@@ -2288,23 +2418,13 @@ def start_server():
     server_socket.settimeout(0.5)
 
     def sigint_handler(sig, frame):
-        global server_running
-        if is_client_connected():
-            print("\n[!] Ctrl+C detected while client is connected -> Executing Cancel (stopping transfer & deleting partial files)...")
-            threading.Thread(
-                target=perform_cancel,
-                kwargs={"session_token": current_active_token, "reason": "Ctrl+C on server while client connected"},
-                daemon=True
-            ).start()
-        else:
-            print("\n[*] Ctrl+C detected with no client connected -> Shutting down server and cleaning up WAL files...")
-            server_running = False
+        threading.Thread(target=handle_ctrl_c_interrupt, daemon=True).start()
 
     signal.signal(signal.SIGINT, sigint_handler)
 
     ips_str = ", ".join(get_local_ips())
     print("\n" + "=" * 78)
-    print(f"[*] EFT High-Speed Server online ({LOCAL_OS.upper()} - {LOCAL_HOSTNAME})")
+    print(f"[*] EFT High-Speed Server v2.4 online ({LOCAL_OS.upper()} - {LOCAL_HOSTNAME})")
     print(f"[*] Server Local IPs : {ips_str}")
     print(f"[*] Socket Port      : {PORT} | Web UI: http://127.0.0.1:{WEB_PORT}")
     print(f"[*] Client curl URL  : curl http://{get_primary_local_ip()}:{WEB_PORT}/download/client.py -o client.py")
@@ -2321,10 +2441,7 @@ def start_server():
             except socket.timeout:
                 continue
             except KeyboardInterrupt:
-                if is_client_connected():
-                    perform_cancel(session_token=current_active_token, reason="Ctrl+C on server while client connected")
-                else:
-                    server_running = False
+                handle_ctrl_c_interrupt()
             except OSError:
                 break
     finally:
@@ -2339,14 +2456,14 @@ def start_server():
 
 
 def run_startup_menu():
-    """Interactive numerical startup menu for EFT Server v4."""
+    """Interactive numerical startup menu for EFT Server v2.4."""
     if "--no-menu" in sys.argv:
         start_server()
         return
 
     while True:
         print("\n" + "=" * 68)
-        print(f" ⚡ EFFICIENT FILE TRANSFER (EFT) v4 — SERVER ({LOCAL_HOSTNAME} | {LOCAL_OS.upper()})")
+        print(f" ⚡ EFFICIENT FILE TRANSFER (EFT) v2.4 — SERVER ({LOCAL_HOSTNAME} | {LOCAL_OS.upper()})")
         print("=" * 68)
         print("  1. Start EFT Server (Engine + Web UI on port 8081)")
         print("  2. Read Old Transfer History (Nano-Style Arrow-Key Viewer)")
