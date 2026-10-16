@@ -93,6 +93,8 @@ Both `server.py` and `client.py` include an interactive terminal startup menu an
 
 ![EFT v4 Interactive Terminal Startup Menu and Nano-Style History Viewer](assets/screenshots/05-terminal-tui-viewer.png)
 
+![EFT v4 Interactive Terminal Startup Menu Client](assets/screenshots/05-terminal-tui-client.png)
+
 ---
 
 ## 🧠 4. Under the Hood: How EFT Works
