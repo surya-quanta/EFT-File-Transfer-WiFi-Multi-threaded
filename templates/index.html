@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Core Engine UI — Efficient File Transfer v4</title>
+    <title>Core Engine UI — Efficient File Transfer v2.4</title>
     <style>
         :root {
             --bg-app: #0d1117;
@@ -823,7 +823,7 @@
             <div class="brand-row">
                 <div style="display:flex; align-items:center;">
                     <span>⚡ EFT Engine</span>
-                    <span class="brand-badge">v4.0</span>
+                    <span class="brand-badge">v2.4.0</span>
                 </div>
                 <button onclick="openConnectOverlay(true)"
                     title="Open Client Discovery & Authentication modal"
@@ -1056,7 +1056,7 @@
         <div class="connect-card">
             <div class="connect-card-header">
                 <div>
-                    <h1>⚡ EFT v4 — Client Discovery & Authentication</h1>
+                    <h1>⚡ EFT v2.4 — Client Discovery & Authentication</h1>
                     <p>Select any waiting client below and enter its password (if locked) to establish a connection.</p>
                 </div>
                 <button onclick="closeConnectOverlay()">✕ Close</button>
@@ -1382,13 +1382,23 @@
                             : (f.name || f.relative_path);
                         const itemIcon = isDirEntry ? '📁' : getFileIcon(f.name || '', false);
                         const sizeLabel = isDirEntry ? 'Folder' : formatBytes(f.size);
+                        const fullSourcePath = f.source_path || f.relative_path || '—';
+                        const fullSavedPath = f.save_path || '—';
+
                         return `
-                        <div class="files-table-row" title="Client Source: ${escapeHtml(f.source_path || f.relative_path || '')}\nServer Saved: ${escapeHtml(f.save_path || '')}">
-                            <div style="overflow:hidden; text-overflow:ellipsis; padding-right:10px;">
+                        <div class="files-table-row" title="Client Relative Path: ${escapeHtml(f.relative_path || '')}">
+                            <div style="overflow:hidden; text-overflow:ellipsis; padding-right:12px; display:flex; flex-direction:column; gap:3px;">
                                 <div style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
                                     ${itemIcon} <strong>${escapeHtml(displayName)}</strong>
                                 </div>
-                                <div class="rel-path-chip" title="Client Relative Path">${escapeHtml(f.relative_path)}</div>
+                                <div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
+                                    <span class="rel-path-chip" title="Full Client Source Path">
+                                        📱 Source: ${escapeHtml(fullSourcePath)}
+                                    </span>
+                                    <span class="rel-path-chip" style="color:#7ee787; border-color:rgba(63,185,80,0.3); background:rgba(63,185,80,0.1);" title="Full Server Saved Path">
+                                        💻 Saved: ${escapeHtml(fullSavedPath)}
+                                    </span>
+                                </div>
                             </div>
                             <div style="color:var(--text-secondary); font-family:Consolas,monospace;">${sizeLabel}</div>
                             <div style="color:var(--text-secondary); font-family:Consolas,monospace;">${f.chunks_done}/${f.chunks_total}</div>
