@@ -967,10 +967,29 @@ def tcp_invite_listener_loop():
         pass
 
 
+known_server_ips = set()
+
+
+def get_client_broadcast_targets():
+    targets = {
+        ('255.255.255.255', DISCOVERY_UDP_PORT),
+        ('127.0.0.1', DISCOVERY_UDP_PORT)
+    }
+    lip = get_local_ip()
+    parts = lip.split('.')
+    if len(parts) == 4 and not lip.startswith('127.'):
+        targets.add((f"{parts[0]}.{parts[1]}.{parts[2]}.255", DISCOVERY_UDP_PORT))
+    if active_server_ip:
+        targets.add((active_server_ip, DISCOVERY_UDP_PORT))
+    for sip in list(known_server_ips):
+        targets.add((sip, DISCOVERY_UDP_PORT))
+    return list(targets)
+
+
 def udp_beacon_and_probe_loop():
     """
-    Periodically broadcast waiting presence (including requires_password flag) to the LAN & localhost
-    so any EFT Server displays this client in its Connect screen.
+    Periodically broadcast waiting presence across all subnet broadcast addresses and known server IPs
+    so the EFT Server always sees this client even when routers filter 255.255.255.255.
     """
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1001,10 +1020,7 @@ def udp_beacon_and_probe_loop():
             "requires_password": REQUIRES_PASSWORD,
             "waiting": not is_connected_to_server
         }).encode('utf-8')
-        targets = [target_addr] if target_addr else [
-            ('255.255.255.255', DISCOVERY_UDP_PORT),
-            ('127.0.0.1', DISCOVERY_UDP_PORT)
-        ]
+        targets = [target_addr] if target_addr else get_client_broadcast_targets()
         for t in targets:
             try:
                 udp_sock.sendto(beacon, t)
@@ -1013,7 +1029,7 @@ def udp_beacon_and_probe_loop():
 
     while client_running:
         now = time.time()
-        interval = 1.5 if not is_connected_to_server else 4.0
+        interval = 1.2 if not is_connected_to_server else 3.0
         if now - last_beacon >= interval:
             send_beacon()
             last_beacon = now
@@ -1023,8 +1039,14 @@ def udp_beacon_and_probe_loop():
             msg = json.loads(data.decode('utf-8'))
             if msg.get("type") == "eft_server_probe":
                 disc_port = int(msg.get("discovery_port") or DISCOVERY_UDP_PORT)
+                known_server_ips.add(addr[0])
+                for sip in (msg.get("server_ips") or []):
+                    known_server_ips.add(sip)
                 send_beacon((addr[0], disc_port))
+                for sip in (msg.get("server_ips") or []):
+                    send_beacon((sip, disc_port))
             elif msg.get("action") == "connect_to_server":
+                known_server_ips.add(addr[0])
                 handle_invite_payload(msg, addr[0])
         except socket.timeout:
             continue
@@ -1258,7 +1280,7 @@ def interactive_history_viewer():
 
         if viewing_session_token is None:
             print(border)
-            print(" ⚡ EFT v4 CLIENT — NANO-STYLE TRANSFER HISTORY VIEWER (client_transfer_history.db)")
+            print(" ⚡ EFT v2.4 CLIENT — NANO-STYLE TRANSFER HISTORY VIEWER (client_transfer_history.db)")
             print(border)
 
             if not sessions:
@@ -1467,7 +1489,7 @@ def main_client_loop():
 
     auth_badge = "LOCKED (Password Required)" if REQUIRES_PASSWORD else "OPEN (No Password)"
     print("\n" + "=" * 76)
-    print(f"[*] EFT Client v4 online ({CLIENT_OS.upper()} | {CLIENT_HOSTNAME})")
+    print(f"[*] EFT Client v2.4 online ({CLIENT_OS.upper()} | {CLIENT_HOSTNAME})")
     print(f"[*] Local IP    : {get_local_ip()} | Invite Port: {bound_invite_port}")
     print(f"[*] Auth Mode   : {auth_badge}")
     print(f"[*] History DB  : {CLIENT_HISTORY_DB_PATH}")
@@ -1491,14 +1513,14 @@ def main_client_loop():
 
 
 def run_startup_menu():
-    """Interactive numerical startup menu for EFT Client v4."""
+    """Interactive numerical startup menu for EFT Client v2.4."""
     if "--no-menu" in sys.argv:
         main_client_loop()
         return
 
     while True:
         print("\n" + "=" * 68)
-        print(f" ⚡ EFFICIENT FILE TRANSFER (EFT) v4 — CLIENT ({CLIENT_HOSTNAME} | {CLIENT_OS.upper()})")
+        print(f" ⚡ EFFICIENT FILE TRANSFER (EFT) v2.4 — CLIENT ({CLIENT_HOSTNAME} | {CLIENT_OS.upper()})")
         print("=" * 68)
         print("  1. Start EFT Client (Configure Password / No Password & Wait for Server)")
         print("  2. Read Old Transfer History (Nano-Style Arrow-Key Viewer)")
