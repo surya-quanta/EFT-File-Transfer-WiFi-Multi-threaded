@@ -1,4 +1,4 @@
-# 🛜 ⚡ Efficient File Transfer (EFT) — v4.0
+# 🛜 ⚡ Efficient File Transfer (EFT) — v3.0
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
@@ -14,7 +14,7 @@ By combining **5 MB direct-write disk pre-allocation**, a **bounded producer-con
 
 ## 📑 Table of Contents
 1. [📊 Real-World Benchmark: Wi-Fi 6 EFT vs. USB MTP](#-1-real-world-benchmark-wi-fi-6-eft-vs-usb-mtp)
-2. [✨ Key Features (v4.0)](#-2-key-features-v40)
+2. [✨ Key Features (v3.0)](#-2-key-features-v3.0)
 3. [📸 Visual Tour & Interface Gallery](#-3-visual-tour--interface-gallery)
 4. [🧠 Under the Hood: How EFT Works](#-4-under-the-hood-how-eft-works)
 5. [🛜 Network Port Topology](#-5-network-port-topology)
@@ -28,9 +28,9 @@ By combining **5 MB direct-write disk pre-allocation**, a **bounded producer-con
 
 ## 📊 1. Real-World Benchmark: Wi-Fi 6 EFT vs. USB MTP
 
-Tested transferring a massive mixed directory (thousands of small source files, nested folders, documents, and large media payloads) from an Android device (running Termux) to a Windows PC over **Wi-Fi 6**:
+Tested transferring a massive mixed directory (thousands of small source files, nested folders, documents, and large media payloads) from an Android device (running Termux) to a Windows PC over **Wi-Fi 5**:
 
-| Benchmark Metric | Traditional USB MTP / Explorer | 🛜 ⚡ EFT Engine v4 (Wi-Fi 6) | Engineering Gain |
+| Benchmark Metric | Traditional USB MTP / Explorer | 🛜 ⚡ EFT Engine v3.0 (Wi-Fi 5) | Engineering Gain |
 | :--- | :--- | :--- | :--- |
 | **Workload Dataset** | 10,735 Files across 77 Folders (~1MB each) | 10,735 Files across 77 Folders (~1MB each) | **Identical Workload** |
 | **Total Data Volume** | 4.60 GB (`4,947,399,050` bytes) | 4.60 GB (`4,947,399,050` bytes) | **100% Byte Parity** |
@@ -40,7 +40,7 @@ Tested transferring a massive mixed directory (thousands of small source files, 
 
 ---
 
-## ✨ 2. Key Features (v4.0)
+## ✨ 2. Key Features (v3.0)
 
 * 🛜 **Zero-Config Wi-Fi / LAN Auto-Discovery:** Clients broadcast lightweight UDP presence beacons (`eft_client_beacon`) and respond to server probes (`eft_server_probe`). No hardcoded IP addresses required.
 * 🔒 **Client-Controlled Password & SHA-256 Handshake:** Security is governed by the sender (`client.py`). At startup, the client operator chooses **No Password (Open)** or configures a **Client Password**. The Server Web UI displays `🔒 Password Protected` or `🔓 Open` badges and prompts for authentication before establishing a control channel.
@@ -63,39 +63,39 @@ Tested transferring a massive mixed directory (thousands of small source files, 
 ### A. Zero-Config Client Discovery & Password Handshake
 When the Web UI opens, it scans the LAN for waiting clients without ever auto-connecting. Locked clients require password verification before the control channel is established.
 
-![EFT v4 Client Discovery and Password Authentication Modal](assets/screenshots/01-discovery-modal.png)
+![EFT v3.0 Client Discovery and Password Authentication Modal](assets/screenshots/01-discovery-modal.png)
 
 ---
 
 ### B. Modern Dual-Pane File Explorer
 Navigate both the **Remote Source Device** (`Android` / `Linux` / `Windows`) and **Local Destination Host** side-by-side with clickable path breadcrumbs, instant file filtering, and batch selection checkboxes.
 
-![EFT v4 Modern Dual-Pane File Explorer and Breadcrumb Navigation](assets/screenshots/02-dual-pane-browser.png)
+![EFT v3.0 Modern Dual-Pane File Explorer and Breadcrumb Navigation](assets/screenshots/02-dual-pane-browser.png)
 
 ---
 
 ### C. High-Speed Multithreaded Transfer in Action
 Watch real-time chunk streaming progress across concurrent workers, with instant access to **Pause**, **Cancel (Partial)**, and **Rollback** controls.
 
-![EFT v4 Real-Time Multithreaded Chunk Streaming Progress](assets/screenshots/03-active-transfer-progress.png)
+![EFT v3.0 Real-Time Multithreaded Chunk Streaming Progress](assets/screenshots/03-active-transfer-progress.png)
 
 ---
 
 ### D. Session History Inspector & Per-File Audit Log
 Every session logs full **Server Host** (`Name`, `IP`, `OS`) and **Client Device** (`Name`, `IP`, `OS`, `Client ID`) metadata, along with each file's client relative path (`relative_path`), client source path, server save path, chunk count, and completion timestamp.
 
-![EFT v4 Session History Inspector and Per-File Audit Log](assets/screenshots/04-session-history-inspector.png)
+![EFT v3.0 Session History Inspector and Per-File Audit Log](assets/screenshots/04-session-history-inspector.png)
 
-![EFT Client v4 Session History Inspector and Per-File Audit Log](assets/screenshots/04-client-session-history-inspector.jpeg)
+![EFT Client v3.0 Session History Inspector and Per-File Audit Log](assets/screenshots/04-client-session-history-inspector.jpeg)
 
 ---
 
 ### E. Interactive Terminal UI (TUI) & Nano-Style History Viewer
 Both `server.py` and `client.py` include an interactive terminal startup menu and a keyboard-driven (`↑`/`↓`/`←`/`→`/`Enter`/`q`) history inspector for headless or terminal workflows.
 
-![EFT v4 Interactive Terminal Startup Menu and Nano-Style History Viewer](assets/screenshots/05-terminal-tui-viewer.png)
+![EFT v3.0 Interactive Terminal Startup Menu and Nano-Style History Viewer](assets/screenshots/05-terminal-tui-viewer.png)
 
-![EFT v4 Interactive Terminal Startup Menu Client](assets/screenshots/05-terminal-tui-client.jpeg)
+![EFT v3.0 Interactive Terminal Startup Menu Client](assets/screenshots/05-terminal-tui-client.jpeg)
 
 ---
 
@@ -220,7 +220,7 @@ Both `server.py` and `client.py` feature a built-in terminal interface that work
 
 ```text
 ====================================================================
- ⚡ EFFICIENT FILE TRANSFER (EFT) v4 — CLIENT (localhost | ANDROID)
+ ⚡ EFFICIENT FILE TRANSFER (EFT) v3.0 — CLIENT (localhost | ANDROID)
 ====================================================================
   1. Start EFT Client (Configure Password / No Password & Wait for Server)
   2. Read Old Transfer History (Nano-Style Arrow-Key Viewer)
