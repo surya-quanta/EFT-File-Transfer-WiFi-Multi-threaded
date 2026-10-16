@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Core Engine UI — Efficient File Transfer v2.4</title>
+    <title>Core Engine UI — Efficient File Transfer v3.0 (Two-Way)</title>
     <style>
         :root {
             --bg-app: #0d1117;
@@ -50,8 +50,8 @@
 
         /* --- SIDEBAR --- */
         .sidebar {
-            width: 280px;
-            min-width: 280px;
+            width: 285px;
+            min-width: 285px;
             background-color: var(--sidebar-bg);
             border-right: 1px solid var(--border-color);
             display: flex;
@@ -201,6 +201,8 @@
         .badge-cancelled { background: rgba(139, 148, 158, 0.18); color: #b1bac4; border: 1px solid rgba(139, 148, 158, 0.4); }
         .badge-rolled_back { background: rgba(248, 81, 73, 0.22); color: #ff7b72; border: 1px solid rgba(248, 81, 73, 0.5); }
         .badge-pending { background: rgba(210, 153, 34, 0.15); color: #e3b341; border: 1px solid rgba(210, 153, 34, 0.4); }
+        .badge-pull { background: rgba(47, 129, 247, 0.16); color: #79c0ff; border: 1px solid rgba(47, 129, 247, 0.4); font-size: 9.5px; padding: 1px 5px; border-radius: 4px; font-weight: 700; }
+        .badge-push { background: rgba(163, 113, 247, 0.18); color: #d2a8ff; border: 1px solid rgba(163, 113, 247, 0.45); font-size: 9.5px; padding: 1px 5px; border-radius: 4px; font-weight: 700; }
         .badge-locked { background: rgba(210, 153, 34, 0.18); color: #e3b341; border: 1px solid rgba(210, 153, 34, 0.45); font-size: 10.5px; padding: 2px 7px; border-radius: 4px; font-weight: 600; }
         .badge-open { background: rgba(63, 185, 80, 0.15); color: #7ee787; border: 1px solid rgba(63, 185, 80, 0.4); font-size: 10.5px; padding: 2px 7px; border-radius: 4px; font-weight: 600; }
 
@@ -274,6 +276,13 @@
             box-shadow: 0 2px 6px rgba(47, 129, 247, 0.3);
         }
         .btn-copy:hover { background: #388bfd; }
+        .btn-push {
+            background: linear-gradient(180deg, #8957e5 0%, #6e40c9 100%);
+            border-color: #a371f7;
+            color: #fff;
+            box-shadow: 0 2px 6px rgba(163, 113, 247, 0.3);
+        }
+        .btn-push:hover { background: #986ee2; }
         .btn-resume { background-color: rgba(63, 185, 80, 0.2); border-color: var(--success); color: #7ee787; }
         .btn-pause { background-color: rgba(210, 153, 34, 0.18); border-color: var(--warning); color: #e3b341; }
         .btn-cancel { background-color: rgba(248, 81, 73, 0.15); border-color: #ff7b72; color: #ffa198; }
@@ -543,6 +552,7 @@
             font-size: 11px;
             color: var(--text-secondary);
             flex-shrink: 0;
+            gap: 8px;
         }
 
         /* --- SESSION HISTORY DETAIL VIEW --- */
@@ -823,7 +833,7 @@
             <div class="brand-row">
                 <div style="display:flex; align-items:center;">
                     <span>⚡ EFT Engine</span>
-                    <span class="brand-badge">v2.4.0</span>
+                    <span class="brand-badge">v3.0</span>
                 </div>
                 <button onclick="openConnectOverlay(true)"
                     title="Open Client Discovery & Authentication modal"
@@ -831,11 +841,11 @@
             </div>
             <button class="new-transfer-btn" id="btn-new-transfer"
                 onclick="switchToNewTransferView()"
-                title="Open dual-pane file browser to start a fresh transfer">
+                title="Open dual-pane file browser to start a PULL or PUSH transfer">
                 <span>＋ New Transfer</span>
             </button>
         </div>
-        <div class="sidebar-section-label">Transfer History</div>
+        <div class="sidebar-section-label">Transfer History (Pull & Push)</div>
         <div class="history-list" id="history-list"></div>
     </aside>
 
@@ -846,10 +856,16 @@
             <div class="toolbar-left">
                 <button onclick="toggleSidebar()" title="Toggle Transfer History Sidebar">☰ History</button>
 
-                <button id="btn-copy" class="action-btn btn-copy"
-                    onclick="sendCommand('start_transfer')"
-                    title="Start multithreaded transfer of checked remote items into the active local directory">
-                    🚀 Copy (0) Items
+                <button id="btn-copy-pull" class="action-btn btn-copy"
+                    onclick="sendCommand('start_transfer', 'pull')"
+                    title="PULL: Copy checked remote client items into the active Local Server directory">
+                    ⬅ Pull to Local (0)
+                </button>
+
+                <button id="btn-copy-push" class="action-btn btn-push"
+                    onclick="sendCommand('start_transfer', 'push')"
+                    title="PUSH: Send checked local server items into the active Remote Client directory">
+                    ➡ Push to Remote (0)
                 </button>
 
                 <button id="btn-pause" class="action-btn btn-pause"
@@ -870,8 +886,8 @@
                     ⟲ Rollback
                 </button>
 
-                <span id="toolbar-hint" title="Check files or folders in the Remote Source panel to start a transfer">
-                    Select remote files or folders to start a transfer
+                <span id="toolbar-hint" title="Check files or folders in either panel to start a Pull or Push transfer">
+                    Check items on Remote (Pull ⬅) or Local (Push ➡) to transfer
                 </span>
             </div>
 
@@ -892,12 +908,12 @@
             </div>
         </div>
 
-        <!-- VIEW 1: DUAL-PANE FILE BROWSER -->
+        <!-- VIEW 1: DUAL-PANE TWO-WAY FILE BROWSER -->
         <div class="workspace" id="new-transfer-view">
-            <!-- Remote Source Panel -->
+            <!-- Remote Client Panel (Source for PULL / Destination for PUSH) -->
             <div class="panel">
                 <div class="panel-title">
-                    <span class="panel-title-text" id="remote-panel-label">📱 Remote Source Device (Not Connected)</span>
+                    <span class="panel-title-text" id="remote-panel-label">📱 Remote Client Device (Not Connected)</span>
                     <span class="os-badge" id="remote-os-badge">REMOTE</span>
                 </div>
                 <div class="address-bar">
@@ -919,27 +935,27 @@
                     <span>Size</span>
                     <span style="text-align:right; padding-right:4px;">
                         <input type="checkbox" id="remote-select-all"
-                            title="Select or unselect all visible items in Remote panel"
-                            onchange="toggleSelectAllRemote(this.checked)">
+                            title="Select or unselect all visible items in Remote panel for PULL transfer"
+                            onchange="toggleSelectAll('remote', this.checked)">
                     </span>
                 </div>
                 <div class="tree-view" id="remote-tree"></div>
                 <div class="panel-footer">
                     <span id="remote-footer-stats">0 folders, 0 files</span>
-                    <span id="remote-footer-selected" style="color:#79c0ff; font-weight:600;">0 selected</span>
+                    <span id="remote-footer-selected" style="color:#79c0ff; font-weight:600;">0 selected (Pull ⬅)</span>
                 </div>
             </div>
 
-            <!-- Local Destination Panel -->
+            <!-- Local Server Panel (Destination for PULL / Source for PUSH) -->
             <div class="panel">
                 <div class="panel-title">
-                    <span class="panel-title-text" id="local-panel-label">💻 Local Destination Host</span>
+                    <span class="panel-title-text" id="local-panel-label">💻 Local Host Server</span>
                     <span class="os-badge" id="local-os-badge">LOCAL</span>
                 </div>
                 <div class="address-bar">
                     <button class="nav-btn" onclick="navigateUp('local')" title="Up to parent directory">↑</button>
                     <input type="text" class="path-input" id="local-path-input" value=""
-                        placeholder="Enter local destination path..."
+                        placeholder="Enter local server path..."
                         onkeydown="handleAddressKey(event, 'local')">
                     <button class="nav-btn" onclick="navigateToInput('local')" title="Go to path & set as destination">→</button>
                     <button class="nav-btn" onclick="navigateToInput('local')" title="Refresh directory">↻</button>
@@ -953,12 +969,19 @@
                     <span>Name</span>
                     <span>Modified</span>
                     <span>Size</span>
-                    <span></span>
+                    <span style="text-align:right; padding-right:4px;">
+                        <input type="checkbox" id="local-select-all"
+                            title="Select or unselect all visible items in Local panel for PUSH transfer"
+                            onchange="toggleSelectAll('local', this.checked)">
+                    </span>
                 </div>
                 <div class="tree-view" id="local-tree"></div>
                 <div class="panel-footer">
                     <span id="local-footer-stats">0 folders, 0 files</span>
-                    <span id="local-footer-dest" style="color:var(--text-muted); font-family:Consolas,monospace;">Active Target</span>
+                    <div style="display:flex; align-items:center; gap:10px;">
+                        <span id="local-footer-selected" style="color:#d2a8ff; font-weight:600;">0 selected (Push ➡)</span>
+                        <span id="local-footer-dest" style="color:var(--text-muted); font-family:Consolas,monospace;">Active Target</span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -968,8 +991,9 @@
             <div class="session-summary-card">
                 <div class="session-header-row">
                     <div class="session-title-group">
-                        <div style="display:flex; align-items:center; gap:10px;">
+                        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
                             <h2 id="sd-title">Transfer Session</h2>
+                            <span id="sd-direction-badge" class="badge-pull">⬅ PULL</span>
                             <span id="sd-status-badge" class="badge badge-completed">COMPLETED</span>
                         </div>
                         <div class="session-sub" id="sd-token">Session ID: —</div>
@@ -998,11 +1022,11 @@
 
                 <div class="session-meta-grid">
                     <div class="meta-box">
-                        <div class="meta-label">Server Host (Receiver)</div>
+                        <div class="meta-label" id="sd-server-label">Server Host</div>
                         <div class="meta-value" id="sd-server">—</div>
                     </div>
                     <div class="meta-box">
-                        <div class="meta-label">Client Device (Sender)</div>
+                        <div class="meta-label" id="sd-client-label">Client Device</div>
                         <div class="meta-value" id="sd-client">—</div>
                     </div>
                     <div class="meta-box">
@@ -1014,7 +1038,7 @@
                         <div class="meta-value" id="sd-completed">—</div>
                     </div>
                     <div class="meta-box">
-                        <div class="meta-label">Server Destination Directory</div>
+                        <div class="meta-label" id="sd-dest-label">Destination Directory</div>
                         <div class="meta-value" id="sd-dest">—</div>
                     </div>
                     <div class="meta-box">
@@ -1026,11 +1050,11 @@
 
             <div class="session-files-panel">
                 <div class="panel-title">
-                    <span>Transferred Files Log (Client Relative Path & Server Save Path)</span>
+                    <span id="sd-files-panel-heading">Transferred Files Log (Source Path & Saved Destination Path)</span>
                     <span id="sd-file-log-summary" style="color:var(--text-secondary); font-weight:normal;">0 items</span>
                 </div>
                 <div class="files-table-header">
-                    <span>File Name & Client Relative Path (Source -> Server)</span>
+                    <span>File Name & Relative Path (Source ➔ Destination)</span>
                     <span>Size</span>
                     <span>Chunks</span>
                     <span>Status</span>
@@ -1056,8 +1080,8 @@
         <div class="connect-card">
             <div class="connect-card-header">
                 <div>
-                    <h1>⚡ EFT v2.4 — Client Discovery & Authentication</h1>
-                    <p>Select any waiting client below and enter its password (if locked) to establish a connection.</p>
+                    <h1>⚡ EFT v3.0 — Client Discovery & Authentication</h1>
+                    <p>Select any waiting client below and enter its password (if locked) to establish a two-way connection.</p>
                 </div>
                 <button onclick="closeConnectOverlay()">✕ Close</button>
             </div>
@@ -1133,6 +1157,7 @@
 
         let lastProgressData = {
             state: 'idle',
+            direction: 'pull',
             active_session_token: '',
             server_hostname: '',
             server_os: '',
@@ -1278,8 +1303,8 @@
             });
         }
 
-        function toggleSelectAllRemote(checked) {
-            const tree = document.getElementById('remote-tree');
+        function toggleSelectAll(source, checked) {
+            const tree = document.getElementById(`${source}-tree`);
             if (!tree) return;
             tree.querySelectorAll('.tree-node').forEach(node => {
                 if (node.style.display === 'none') return;
@@ -1301,10 +1326,10 @@
             document.getElementById('remote-filter-input').value = '';
             document.getElementById('remote-select-all').checked = false;
             document.getElementById('remote-os-badge').innerText = 'REMOTE';
-            document.getElementById('remote-panel-label').innerText = '📱 Remote Source Device (Not Connected)';
+            document.getElementById('remote-panel-label').innerText = '📱 Remote Client Device (Not Connected)';
             document.getElementById('remote-breadcrumbs').innerHTML = '<span style="color:var(--text-muted);">Offline</span>';
             document.getElementById('remote-footer-stats').innerText = '0 folders, 0 files';
-            document.getElementById('remote-footer-selected').innerText = '0 selected';
+            document.getElementById('remote-footer-selected').innerText = '0 selected (Pull ⬅)';
             document.getElementById('remote-tree').innerHTML =
                 `<div class="empty-state-box">${escapeHtml(reasonMsg)}</div>`;
             updateSmartToolbar();
@@ -1339,7 +1364,14 @@
                 if (data.status !== 'success' || !data.session) return;
 
                 const s = data.session;
+                const isPush = (s.direction || 'pull').toLowerCase() === 'push';
+
                 document.getElementById('sd-title').innerText = s.title || 'Transfer Session';
+
+                const dirBadge = document.getElementById('sd-direction-badge');
+                dirBadge.className = isPush ? 'badge-push' : 'badge-pull';
+                dirBadge.innerText = isPush ? '➡ PUSH (SERVER ➔ CLIENT)' : '⬅ PULL (CLIENT ➔ SERVER)';
+
                 const badge = document.getElementById('sd-status-badge');
                 badge.className = getStatusBadgeClass(s.status);
                 badge.innerText = (s.status || 'idle').replace('_', ' ').toUpperCase();
@@ -1348,6 +1380,10 @@
                 document.getElementById('sd-progress-fill').style.width = `${s.percent}%`;
                 document.getElementById('sd-progress-text').innerText = `${s.percent}% (${(s.status || '').toUpperCase()})`;
                 document.getElementById('sd-chunks-text').innerText = `${s.received_chunks} / ${s.total_chunks} Chunks`;
+
+                document.getElementById('sd-server-label').innerText = isPush ? 'Server Host (Sender)' : 'Server Host (Receiver)';
+                document.getElementById('sd-client-label').innerText = isPush ? 'Client Device (Receiver)' : 'Client Device (Sender)';
+                document.getElementById('sd-dest-label').innerText = isPush ? 'Client Destination Directory' : 'Server Destination Directory';
 
                 document.getElementById('sd-server').innerText =
                     `${s.server_name || 'Server'} (${s.server_ip || 'LAN'}) [${(s.server_os || 'OS').toUpperCase()}]`;
@@ -1370,7 +1406,7 @@
 
                 const tbody = document.getElementById('sd-files-tbody');
                 const files = s.files || [];
-                document.getElementById('sd-file-log-summary').innerText = `${files.length} file(s) logged`;
+                document.getElementById('sd-file-log-summary').innerText = `${files.length} item(s) logged`;
 
                 if (files.length === 0) {
                     tbody.innerHTML = '<div class="empty-state-box">No files recorded for this session yet.</div>';
@@ -1385,18 +1421,21 @@
                         const fullSourcePath = f.source_path || f.relative_path || '—';
                         const fullSavedPath = f.save_path || '—';
 
+                        const srcLabel = isPush ? '💻 Server Source' : '📱 Client Source';
+                        const dstLabel = isPush ? '📱 Client Saved' : '💻 Server Saved';
+
                         return `
-                        <div class="files-table-row" title="Client Relative Path: ${escapeHtml(f.relative_path || '')}">
+                        <div class="files-table-row" title="Relative Path: ${escapeHtml(f.relative_path || '')}">
                             <div style="overflow:hidden; text-overflow:ellipsis; padding-right:12px; display:flex; flex-direction:column; gap:3px;">
                                 <div style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
                                     ${itemIcon} <strong>${escapeHtml(displayName)}</strong>
                                 </div>
                                 <div style="display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
-                                    <span class="rel-path-chip" title="Full Client Source Path">
-                                        📱 Source: ${escapeHtml(fullSourcePath)}
+                                    <span class="rel-path-chip" title="${srcLabel}">
+                                        ${srcLabel}: ${escapeHtml(fullSourcePath)}
                                     </span>
-                                    <span class="rel-path-chip" style="color:#7ee787; border-color:rgba(63,185,80,0.3); background:rgba(63,185,80,0.1);" title="Full Server Saved Path">
-                                        💻 Saved: ${escapeHtml(fullSavedPath)}
+                                    <span class="rel-path-chip" style="color:#7ee787; border-color:rgba(63,185,80,0.3); background:rgba(63,185,80,0.1);" title="${dstLabel}">
+                                        ${dstLabel}: ${escapeHtml(fullSavedPath)}
                                     </span>
                                 </div>
                             </div>
@@ -1437,16 +1476,21 @@
                 if (data.status !== 'success' || !Array.isArray(data.sessions)) return;
 
                 if (data.sessions.length === 0) {
-                    listEl.innerHTML = '<div class="empty-state-box">No transfer history yet. Connect a client and start a transfer.</div>';
+                    listEl.innerHTML = '<div class="empty-state-box">No transfer history yet. Connect a client and start a Pull or Push transfer.</div>';
                     return;
                 }
 
                 listEl.innerHTML = '';
                 data.sessions.forEach(sess => {
+                    const isPush = (sess.direction || 'pull').toLowerCase() === 'push';
+                    const dirBadgeHtml = isPush
+                        ? `<span class="badge-push" title="PUSH: Server to Client">➡ PUSH</span>`
+                        : `<span class="badge-pull" title="PULL: Client to Server">⬅ PULL</span>`;
+
                     const item = document.createElement('div');
                     item.className = 'history-item' + (selectedSessionToken === sess.session_token ? ' active' : '');
                     item.title =
-                        `${sess.title}\n` +
+                        `${sess.title} (${isPush ? 'PUSH: Server -> Client' : 'PULL: Client -> Server'})\n` +
                         `Status: ${sess.status.toUpperCase()}\n` +
                         `Client: ${sess.client_name} (${sess.client_ip}) [${(sess.client_os || '').toUpperCase()}]\n` +
                         `Server: ${sess.server_name} (${sess.server_ip}) [${(sess.server_os || '').toUpperCase()}]\n` +
@@ -1457,12 +1501,17 @@
                     topRow.className = 'history-item-top';
                     topRow.innerHTML = `
                         <span class="history-title">📁 ${escapeHtml(sess.title)}</span>
-                        <span class="${getStatusBadgeClass(sess.status)}">${escapeHtml(sess.status.replace('_', ' '))}</span>
+                        <div style="display:flex; gap:4px; align-items:center;">
+                            ${dirBadgeHtml}
+                            <span class="${getStatusBadgeClass(sess.status)}">${escapeHtml(sess.status.replace('_', ' '))}</span>
+                        </div>
                     `;
 
                     const peerRow = document.createElement('div');
                     peerRow.className = 'history-peers';
-                    peerRow.innerText = `${sess.client_name} (${sess.client_ip || '?'}) → ${sess.server_name}`;
+                    peerRow.innerText = isPush
+                        ? `${sess.server_name} ➔ ${sess.client_name} (${sess.client_ip || '?'})`
+                        : `${sess.client_name} (${sess.client_ip || '?'}) ➔ ${sess.server_name}`;
 
                     const bottomRow = document.createElement('div');
                     bottomRow.className = 'history-meta';
@@ -1478,7 +1527,7 @@
                     if (sess.can_resume && lastProgressData.client_online) {
                         const rBtn = document.createElement('button');
                         rBtn.className = 'mini-resume-btn';
-                        rBtn.innerText = `▶ Resume Incomplete (${sess.percent}%)`;
+                        rBtn.innerText = `▶ Resume ${isPush ? 'Push' : 'Pull'} (${sess.percent}%)`;
                         rBtn.onclick = (e) => {
                             e.stopPropagation();
                             openSessionDetail(sess.session_token);
@@ -1714,24 +1763,30 @@
         }
 
         function updateSmartToolbar() {
-            const checkedBoxes = document.querySelectorAll('#remote-tree input[type="checkbox"]:checked');
-            const checkedCount = checkedBoxes.length;
+            const remoteCheckedCount = document.querySelectorAll('#remote-tree input[type="checkbox"]:checked').length;
+            const localCheckedCount = document.querySelectorAll('#local-tree input[type="checkbox"]:checked').length;
             const state = lastProgressData.state || 'idle';
             const clientOnline = !!lastProgressData.client_online;
 
-            const selFooter = document.getElementById('remote-footer-selected');
-            if (selFooter) {
-                selFooter.innerText = `${checkedCount} item${checkedCount === 1 ? '' : 's'} selected`;
+            const remSelFooter = document.getElementById('remote-footer-selected');
+            if (remSelFooter) {
+                remSelFooter.innerText = `${remoteCheckedCount} selected (Pull ⬅)`;
+            }
+            const locSelFooter = document.getElementById('local-footer-selected');
+            if (locSelFooter) {
+                locSelFooter.innerText = `${localCheckedCount} selected (Push ➡)`;
             }
 
-            const btnCopy = document.getElementById('btn-copy');
+            const btnPull = document.getElementById('btn-copy-pull');
+            const btnPush = document.getElementById('btn-copy-push');
             const btnPause = document.getElementById('btn-pause');
             const btnCancel = document.getElementById('btn-cancel');
             const btnRollback = document.getElementById('btn-rollback');
             const btnDisconnect = document.getElementById('btn-disconnect-toolbar');
             const hint = document.getElementById('toolbar-hint');
 
-            btnCopy.style.display = 'none';
+            btnPull.style.display = 'none';
+            btnPush.style.display = 'none';
             btnPause.style.display = 'none';
             btnCancel.style.display = 'none';
             btnRollback.style.display = 'none';
@@ -1743,9 +1798,15 @@
                 return;
             }
 
-            if (state !== 'active' && checkedCount > 0 && clientOnline) {
-                btnCopy.style.display = 'inline-flex';
-                btnCopy.innerText = `🚀 Copy (${checkedCount}) Item${checkedCount > 1 ? 's' : ''}`;
+            if (state !== 'active' && clientOnline) {
+                if (remoteCheckedCount > 0) {
+                    btnPull.style.display = 'inline-flex';
+                    btnPull.innerText = `⬅ Pull to Local (${remoteCheckedCount})`;
+                }
+                if (localCheckedCount > 0) {
+                    btnPush.style.display = 'inline-flex';
+                    btnPush.innerText = `➡ Push to Remote (${localCheckedCount})`;
+                }
             }
 
             if (state === 'active') {
@@ -1757,11 +1818,11 @@
                 btnRollback.style.display = 'inline-flex';
             }
 
-            const anyVisible = [btnCopy, btnPause, btnCancel, btnRollback].some(b => b.style.display !== 'none');
+            const anyVisible = [btnPull, btnPush, btnPause, btnCancel, btnRollback].some(b => b.style.display !== 'none');
             if (!anyVisible) {
                 hint.style.display = 'inline';
                 hint.innerText = clientOnline
-                    ? 'Check remote files or folders to start a transfer'
+                    ? 'Check items on Remote (Pull ⬅) or Local (Push ➡) to start a transfer'
                     : 'No client connected — click "Connect / Switch Client"';
             } else {
                 hint.style.display = 'none';
@@ -1773,10 +1834,9 @@
             const targetPath = requestedPath !== undefined ? requestedPath : inputField.value.trim();
             const filterField = document.getElementById(`${source}-filter-input`);
             if (filterField) filterField.value = '';
-            if (source === 'remote') {
-                const selAll = document.getElementById('remote-select-all');
-                if (selAll) selAll.checked = false;
-            }
+            const selAll = document.getElementById(`${source}-select-all`);
+            if (selAll) selAll.checked = false;
+
             const treeContainer = document.getElementById(`${source}-tree`);
             treeContainer.innerHTML = '<div class="empty-state-box">Loading directory...</div>';
             await fetchAndRender(treeContainer, source, targetPath, true);
@@ -1865,11 +1925,13 @@
                         const checkCol = document.createElement('div');
                         checkCol.className = 'item-checkbox';
                         let cb = null;
-                        if (source === 'remote' && data.current_path !== 'DRIVES') {
+                        if (data.current_path !== 'DRIVES') {
                             cb = document.createElement('input');
                             cb.type = 'checkbox';
                             cb.value = item.path;
-                            cb.title = `Select ${item.name} for transfer`;
+                            cb.title = source === 'remote'
+                                ? `Select ${item.name} to PULL to Local Server`
+                                : `Select ${item.name} to PUSH to Remote Client`;
                             cb.onclick = (e) => e.stopPropagation();
                             cb.onchange = () => {
                                 row.classList.toggle('selected-row', cb.checked);
@@ -1942,33 +2004,48 @@
             }
         }
 
-        async function sendCommand(actionType) {
-            const checkedBoxes = Array.from(document.querySelectorAll('#remote-tree input[type="checkbox"]:checked')).map(cb => cb.value);
-            const destPath = document.getElementById('local-path-input').value.trim();
+        async function sendCommand(actionType, direction = 'pull') {
+            const localPath = document.getElementById('local-path-input').value.trim();
+            const remotePath = document.getElementById('remote-path-input').value.trim();
+
+            let checkedBoxes = [];
+            if (actionType === 'start_transfer') {
+                const treeSelector = direction === 'push' ? '#local-tree' : '#remote-tree';
+                checkedBoxes = Array.from(document.querySelectorAll(`${treeSelector} input[type="checkbox"]:checked`)).map(cb => cb.value);
+            }
 
             const res = await fetch('/api/action', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     action: actionType,
+                    direction: direction,
                     paths: checkedBoxes,
-                    dest_path: destPath,
+                    dest_path: direction === 'push' ? remotePath : localPath,
+                    remote_dest_path: remotePath,
                     session_token: lastProgressData.active_session_token || null
                 })
             });
             const data = await res.json();
 
             if (actionType === 'start_transfer' && data.session_token) {
-                document.querySelectorAll('#remote-tree input[type="checkbox"]:checked').forEach(cb => {
+                const treeId = direction === 'push' ? 'local' : 'remote';
+                document.querySelectorAll(`#${treeId}-tree input[type="checkbox"]:checked`).forEach(cb => {
                     cb.checked = false;
                     const row = cb.closest('.tree-item-container');
                     if (row) row.classList.remove('selected-row');
                 });
-                const selAll = document.getElementById('remote-select-all');
+                const selAll = document.getElementById(`${treeId}-select-all`);
                 if (selAll) selAll.checked = false;
             }
+
             if (actionType === 'cancel_transfer' || actionType === 'rollback_transfer') {
-                setTimeout(() => initializeRoot('local', destPath), 300);
+                setTimeout(() => {
+                    initializeRoot('local', localPath);
+                    if (lastProgressData.client_online) {
+                        initializeRoot('remote', remotePath);
+                    }
+                }, 300);
             }
             await pollProgress();
             await loadSessionsSidebar();
@@ -1980,6 +2057,7 @@
                 const data = await res.json();
                 const prevOnline = lastProgressData.client_online;
                 const prevState = lastProgressData.state;
+                const prevDir = lastProgressData.direction || 'pull';
                 const peerChanged = (lastPeerSeq !== -1 && data.peer_seq !== lastPeerSeq);
                 lastPeerSeq = data.peer_seq || 0;
                 lastProgressData = data;
@@ -1987,7 +2065,7 @@
                 if (data.server_hostname) {
                     const srvIps = (data.server_ips || []).join(', ');
                     document.getElementById('local-panel-label').innerText =
-                        `💻 Local Destination: ${data.server_hostname} (${srvIps || 'Local'})`;
+                        `💻 Local Host: ${data.server_hostname} (${srvIps || 'Local'})`;
                 }
 
                 if (!welcomeAutoShown && !data.client_online) {
@@ -2007,7 +2085,12 @@
                 }
 
                 if (prevState === 'active' && data.state === 'completed') {
-                    initializeRoot('local', document.getElementById('local-path-input').value.trim());
+                    const activeDir = (data.direction || prevDir || 'pull').toLowerCase();
+                    if (activeDir === 'push') {
+                        initializeRoot('remote', document.getElementById('remote-path-input').value.trim());
+                    } else {
+                        initializeRoot('local', document.getElementById('local-path-input').value.trim());
+                    }
                     loadSessionsSidebar();
                 }
 
@@ -2018,7 +2101,7 @@
                     clientPill.innerText = `${lockIcon}Client: ${c.hostname} (${c.ip})`;
                     clientPill.className = 'status-pill status-online';
                     document.getElementById('remote-panel-label').innerText =
-                        `📱 Remote Source: ${c.hostname} (${c.ip})`;
+                        `📱 Remote Client: ${c.hostname} (${c.ip})`;
                     if (c.os) {
                         document.getElementById('remote-os-badge').innerText = c.os.toUpperCase();
                     }
@@ -2028,13 +2111,18 @@
                 }
 
                 const statePill = document.getElementById('transfer-state-pill');
-                statePill.innerText = `State: ${(data.state || 'idle').toUpperCase()}`;
+                const dirPrefix = data.state === 'active'
+                    ? ((data.direction || 'pull').toLowerCase() === 'push' ? '➡ PUSH: ' : '⬅ PULL: ')
+                    : 'State: ';
+                statePill.innerText = `${dirPrefix}${(data.state || 'idle').toUpperCase()}`;
 
                 const box = document.getElementById('progress-box');
                 if (currentViewMode === 'new_transfer' && data.state === 'active') {
+                    const isPush = (data.direction || 'pull').toLowerCase() === 'push';
                     box.style.display = 'block';
                     document.getElementById('pb-fill').style.width = data.percent + '%';
-                    document.getElementById('pb-text').innerText = `${data.percent}% Transferring...`;
+                    document.getElementById('pb-text').innerText =
+                        `${data.percent}% ${isPush ? '➡ Pushing to Remote Client...' : '⬅ Pulling to Local Host (Server)...'}`;
                     document.getElementById('pb-chunks').innerText = `${data.received} / ${data.total} Chunks`;
                     document.getElementById('pb-files').innerText =
                         (data.active_files || []).map(f => `[${f.done}/${f.total}] ${f.relative_path || f.name}`).join(' | ');
