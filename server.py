@@ -310,6 +310,20 @@ def list_os_directory(target_path, default_path):
         return {"status": "error", "message": str(e), "os": LOCAL_OS, "current_path": target_path}
 
 
+import stat as stat_module
+
+
+def is_regular_readable_file(path):
+    """Fast metadata-only check: returns True ONLY for real non-symlink regular files (skips sockets, FIFOs, symlinks)."""
+    try:
+        st = os.lstat(path)
+        if not stat_module.S_ISREG(st.st_mode):
+            return False
+        return os.access(path, os.R_OK)
+    except (PermissionError, OSError):
+        return False
+
+
 def build_local_manifest(target_paths):
     """Build a POSIX-normalized file & empty-folder manifest from local server paths for PUSH transfers."""
     manifest = {"files": [], "dirs": [], "total_bytes": 0}
@@ -323,6 +337,8 @@ def build_local_manifest(target_paths):
         parent_dir = os.path.dirname(target_path.rstrip('/\\'))
 
         if os.path.isfile(target_path):
+            if not is_regular_readable_file(target_path):
+                continue
             try:
                 stat = os.stat(target_path)
                 rel_path = normalize_rel_path(os.path.basename(target_path))
@@ -339,23 +355,15 @@ def build_local_manifest(target_paths):
                 continue
 
         elif os.path.isdir(target_path):
-            for root, dirs, files in os.walk(target_path):
-                if not files and not dirs:
-                    try:
-                        stat = os.stat(root)
-                        rel_dir = normalize_rel_path(os.path.relpath(root, parent_dir))
-                        if rel_dir:
-                            manifest["dirs"].append({
-                                "relative_path": rel_dir,
-                                "source_path": root,
-                                "mtime": stat.st_mtime,
-                                "atime": stat.st_atime
-                            })
-                    except (PermissionError, OSError):
-                        pass
+            for root, dirs, files in os.walk(target_path, followlinks=False):
+                # Filter out symlinked directories so Wine/Linux symlink loops are skipped
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+                valid_files_in_dir = 0
 
                 for file in files:
                     full_path = os.path.join(root, file)
+                    if not is_regular_readable_file(full_path):
+                        continue
                     try:
                         stat = os.stat(full_path)
                         rel_raw = os.path.relpath(full_path, parent_dir)
@@ -369,8 +377,23 @@ def build_local_manifest(target_paths):
                         })
                         manifest["total_bytes"] += stat.st_size
                         local_mapping[rel_path] = full_path
+                        valid_files_in_dir += 1
                     except (PermissionError, OSError):
                         continue
+
+                if valid_files_in_dir == 0 and not dirs:
+                    try:
+                        stat = os.stat(root)
+                        rel_dir = normalize_rel_path(os.path.relpath(root, parent_dir))
+                        if rel_dir:
+                            manifest["dirs"].append({
+                                "relative_path": rel_dir,
+                                "source_path": root,
+                                "mtime": stat.st_mtime,
+                                "atime": stat.st_atime
+                            })
+                    except (PermissionError, OSError):
+                        pass
 
     return manifest, local_mapping
 
@@ -871,6 +894,8 @@ def perform_cancel(session_token=None, reason="User cancelled transfer"):
                 WHERE session_token=? AND status != 'completed'
             """, (session_token,))
             sync_session_metrics(session_token, override_status='cancelled')
+            
+           
             if current_active_token == session_token:
                 current_active_token = None
                 set_meta('transfer_state', 'idle')
@@ -1025,8 +1050,6 @@ def process_and_compress_push_chunks(local_mapping, manifest, chunk_queue, missi
         server_file_id = m_entry.get("server_file_id", client_file_id)
         missing_indices = sorted(m_entry.get("missing", []))
         full_path = local_mapping.get(rel_path) or file_info.get("source_path")
-        if not full_path or not os.path.exists(full_path):
-            continue
 
         try:
             with open(full_path, 'rb') as f:
@@ -1034,9 +1057,7 @@ def process_and_compress_push_chunks(local_mapping, manifest, chunk_queue, missi
                     if not push_transfer_active:
                         break
                     f.seek(chunk_index * CHUNK_SIZE)
-                    raw_bytes = f.read(CHUNK_SIZE)
-                    if not raw_bytes and file_info["size"] > 0:
-                        break
+                    raw_bytes = f.read(CHUNK_SIZE) or b""
                     compressed = cctx.compress(raw_bytes) if can_use_zstd else zlib.compress(raw_bytes, level=1)
                     while push_transfer_active:
                         try:
@@ -1053,13 +1074,25 @@ def process_and_compress_push_chunks(local_mapping, manifest, chunk_queue, missi
                         except queue.Full:
                             continue
         except (PermissionError, OSError):
-            continue
-
-    for _ in range(12):
-        try:
-            chunk_queue.put(None, timeout=1.0)
-        except Exception:
-            pass
+            # If a file vanished or locked after manifest creation, send empty chunks so the session never hangs at 99.9%
+            empty_comp = cctx.compress(b"") if can_use_zstd else zlib.compress(b"", level=1)
+            for chunk_index in missing_indices:
+                if not push_transfer_active:
+                    break
+                while push_transfer_active:
+                    try:
+                        chunk_queue.put({
+                            "client_file_id": client_file_id,
+                            "server_file_id": server_file_id,
+                            "relative_path": rel_path,
+                            "file_size": file_info["size"],
+                            "chunk_index": chunk_index,
+                            "comp": comp_label,
+                            "data": empty_comp
+                        }, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
 
 
 def start_push_session_on_server(session_token, paths, remote_dest_dir, is_resume=False):
@@ -1167,6 +1200,8 @@ def handle_push_manifest_processed(msg):
     manifest, local_mapping = build_local_manifest(paths)
 
     with db_lock:
+        db_conn.execute("BEGIN IMMEDIATE")
+        history_conn.execute("BEGIN IMMEDIATE")
         # Reset server-side file/chunk bitmap for this PUSH session and rebuild from client's missing_map
         db_conn.execute("DELETE FROM chunks WHERE file_id IN (SELECT file_id FROM files WHERE session_token=?)", (token,))
         db_conn.execute("DELETE FROM files WHERE session_token=?", (token,))
@@ -1243,6 +1278,8 @@ def handle_push_manifest_processed(msg):
         comp_f, tot_f, recv_c, tot_c = sync_session_metrics(
             token, override_status='completed' if not missing_map else 'active'
         )
+        db_conn.execute("COMMIT")
+        history_conn.execute("COMMIT")
 
     num_files = len(manifest.get("files", []))
     num_dirs = len(manifest.get("dirs", []))
@@ -1315,12 +1352,22 @@ def handle_push_worker_stream(conn, worker_session_token):
             chunk_data = chunk["data"]
 
             header = struct.pack('!II', len(meta_bytes), len(chunk_data))
-            conn.sendall(header + meta_bytes + chunk_data)
+            try:
+                conn.sendall(header + meta_bytes + chunk_data)
+                ack_msg = recv_json_line(conn)
+            except Exception:
+                ack_msg = None
 
-            ack_msg = recv_json_line(conn)
-            push_work_queue.task_done()
             if not ack_msg or not isinstance(ack_msg, dict):
+                # Re-queue the unacknowledged chunk so a surviving worker thread delivers it!
+                if push_transfer_active and push_work_queue is not None:
+                    try:
+                        push_work_queue.put_nowait(chunk)
+                    except Exception:
+                        pass
+                push_work_queue.task_done()
                 break
+            push_work_queue.task_done()
 
             srv_file_id = chunk.get("server_file_id")
             chunk_idx = chunk["chunk_index"]
@@ -1375,6 +1422,12 @@ def handle_push_worker_stream(conn, worker_session_token):
 
             if all_done:
                 push_transfer_active = False
+                if push_work_queue is not None:
+                    for _ in range(8):
+                        try:
+                            push_work_queue.put_nowait(None)
+                        except Exception:
+                            break
                 finalize_db_wal()
                 with console_print_lock:
                     print(f"[*] PUSH Session {worker_session_token[:8]} completed! WAL checkpointed and cleaned up.")
@@ -1536,13 +1589,14 @@ def process_pull_manifest_dict(manifest_payload, addr_ip):
     routed_srv_ip = (connected_client_info or {}).get("server_ip") or get_primary_local_ip()
 
     with db_lock:
+        db_conn.execute("BEGIN IMMEDIATE")
+        history_conn.execute("BEGIN IMMEDIATE")
         active_sessions.add(token)
         current_active_token = token
         set_meta('session_token', token)
         set_meta('transfer_state', 'active')
 
-        db_conn.execute("BEGIN IMMEDIATE")
-        history_conn.execute("BEGIN IMMEDIATE")
+        
         sess_row = history_conn.execute(
             "SELECT destination_path, title FROM transfer_sessions WHERE session_token=?", (token,)
         ).fetchone()
@@ -1729,11 +1783,11 @@ def spawn_server_outbound_workers(session_token, mode="pull"):
     Because Server -> Client (8083) is the exact direction that established the Control Channel,
     this guarantees 4 high-speed worker streams even if Windows Firewall or Android Hotspot blocks Server port 8080!
     """
-    time.sleep(0.4)
+    time.sleep(1.5)
     if session_token not in active_sessions:
         return
     with worker_conn_lock:
-        if len(active_worker_connections) >= 2:
+        if len(active_worker_connections) >= 1:
             return
 
     c_info = connected_client_info or {}
