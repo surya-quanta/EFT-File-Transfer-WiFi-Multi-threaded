@@ -495,6 +495,13 @@ def init_dbs():
         WHERE status = 'active' AND received_chunks < total_chunks
     """, (time.time(),))
 
+    # Create indexes so session_token and file_id lookups are O(log N) instead of full-table scans
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_token)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_files_rel ON files(session_token, relative_path)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_status ON chunks(file_id, status)")
+    hconn.execute("CREATE INDEX IF NOT EXISTS idx_hist_files_session ON transfer_history_files(session_token)")
+    hconn.execute("CREATE INDEX IF NOT EXISTS idx_hist_files_status ON transfer_history_files(session_token, status)")
+
     # Reload any incomplete session tokens so they can be resumed
     for row in hconn.execute("SELECT session_token FROM transfer_sessions WHERE status IN ('paused', 'interrupted', 'completed')").fetchall():
         if row[0]:
@@ -1262,8 +1269,12 @@ def handle_push_manifest_processed(msg):
 
 
 def handle_push_worker_stream(conn, worker_session_token):
-    """Stream compressed chunks from server's push_work_queue to a client push_worker_auth socket."""
+    """Stream compressed chunks from server's push_work_queue to a client push_worker_auth socket with O(1) DB updates."""
     global push_transfer_active, push_work_queue
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
     with worker_conn_lock:
         active_worker_connections.add(conn)
     try:
@@ -1277,7 +1288,6 @@ def handle_push_worker_stream(conn, worker_session_token):
 
             if chunk is None:
                 push_work_queue.task_done()
-                # Send zero-length sentinel header so client worker knows stream finished cleanly
                 try:
                     conn.sendall(struct.pack('!II', 0, 0))
                 except Exception:
@@ -1307,6 +1317,10 @@ def handle_push_worker_stream(conn, worker_session_token):
             file_done = bool(ack_msg.get("file_completed", False))
             sess_done = bool(ack_msg.get("session_completed", False))
             done_ts = ack_msg.get("transferred_at") or time.time()
+            comp_f = ack_msg.get("completed_files", 0)
+            tot_f = ack_msg.get("total_files", 0)
+            recv_c = ack_msg.get("received_chunks", 0)
+            tot_c = ack_msg.get("total_chunks", 0)
 
             with db_lock:
                 if srv_file_id:
@@ -1321,21 +1335,23 @@ def handle_push_worker_stream(conn, worker_session_token):
                         WHERE session_token = ? AND relative_path = ?
                     """, (done_ts, worker_session_token, rel_p))
 
-                cursor = db_conn.execute("""
-                    SELECT COUNT(*) FROM chunks c
-                    INNER JOIN files f ON c.file_id = f.file_id
-                    WHERE f.session_token = ? AND c.status = 'pending'
-                """, (worker_session_token,))
-                total_pending = cursor.fetchone()[0] or 0
-                if total_pending == 0 or sess_done:
+                if sess_done:
                     set_meta('transfer_state', 'completed')
                     comp_f, tot_f, recv_c, tot_c = sync_session_metrics(worker_session_token, override_status='completed')
                     all_done = True
                 else:
-                    comp_f, tot_f, recv_c, tot_c = sync_session_metrics(worker_session_token)
+                    # O(1) primary-key update instead of scanning 11,000+ rows on every chunk!
+                    history_conn.execute("""
+                        UPDATE transfer_sessions
+                        SET updated_at = ?,
+                            completed_files = CASE WHEN ? > completed_files THEN ? ELSE completed_files END,
+                            received_chunks = CASE WHEN ? > received_chunks THEN ? ELSE received_chunks + 1 END,
+                            transferred_bytes = CASE WHEN ? > 0 THEN (total_bytes * ?) / ? ELSE transferred_bytes END
+                        WHERE session_token = ?
+                    """, (done_ts, comp_f, comp_f, recv_c, recv_c, tot_c, recv_c, tot_c, worker_session_token))
                     all_done = False
 
-            if file_done:
+            if file_done and (tot_f <= 100 or f_size >= 1024 * 1024 or comp_f % 50 == 0 or all_done):
                 pct = round((recv_c / tot_c * 100), 1) if tot_c else 100.0
                 c_name = (connected_client_info or {}).get("hostname", "Client")
                 c_ip = (connected_client_info or {}).get("ip", "")
@@ -1777,7 +1793,18 @@ def api_get_sessions():
 
 @app.route('/api/sessions/<session_token>', methods=['GET'])
 def api_get_session_detail(session_token):
-    """Return full metadata (Direction + Server + Client identification) and file history for a specific session."""
+    """Return full metadata and paginated file history for a specific session so large sessions never lag the UI."""
+    try:
+        page = max(1, int(request.args.get('page', 1)))
+    except Exception:
+        page = 1
+    try:
+        per_page = min(500, max(10, int(request.args.get('per_page', 100))))
+    except Exception:
+        per_page = 100
+    search_q = (request.args.get('search') or '').strip().lower()
+    offset = (page - 1) * per_page
+
     with db_lock:
         r = history_conn.execute("""
             SELECT session_token, title, direction,
@@ -1793,21 +1820,51 @@ def api_get_session_detail(session_token):
         if not r:
             return jsonify({"status": "error", "message": "Session not found."}), 404
 
-        f_rows = history_conn.execute("""
-            SELECT id, file_id, relative_path, source_path, save_path, size, mtime, status, transferred_at, pre_existed
-            FROM transfer_history_files
-            WHERE session_token = ?
-            ORDER BY id ASC
-        """, (session_token,)).fetchall()
+        if search_q:
+            like_pat = f"%{search_q}%"
+            total_log_rows = history_conn.execute("""
+                SELECT COUNT(*) FROM transfer_history_files
+                WHERE session_token = ? AND LOWER(relative_path) LIKE ?
+            """, (session_token, like_pat)).fetchone()[0] or 0
 
+            f_rows = history_conn.execute("""
+                SELECT id, file_id, relative_path, source_path, save_path, size, mtime, status, transferred_at, pre_existed
+                FROM transfer_history_files
+                WHERE session_token = ? AND LOWER(relative_path) LIKE ?
+                ORDER BY id ASC
+                LIMIT ? OFFSET ?
+            """, (session_token, like_pat, per_page, offset)).fetchall()
+        else:
+            total_log_rows = history_conn.execute("""
+                SELECT COUNT(*) FROM transfer_history_files
+                WHERE session_token = ?
+            """, (session_token,)).fetchone()[0] or 0
+
+            f_rows = history_conn.execute("""
+                SELECT id, file_id, relative_path, source_path, save_path, size, mtime, status, transferred_at, pre_existed
+                FROM transfer_history_files
+                WHERE session_token = ?
+                ORDER BY id ASC
+                LIMIT ? OFFSET ?
+            """, (session_token, per_page, offset)).fetchall()
+
+        page_fids = [fr[1] for fr in f_rows if fr[1]]
         chunk_progress = {}
-        for fid, tot, done in db_conn.execute("""
-            SELECT file_id, COUNT(*), SUM(CASE WHEN status='received' THEN 1 ELSE 0 END)
-            FROM chunks
-            WHERE file_id IN (SELECT file_id FROM files WHERE session_token=?)
-            GROUP BY file_id
-        """, (session_token,)).fetchall():
-            chunk_progress[fid] = (tot or 0, done or 0)
+        if page_fids:
+            placeholders = ",".join("?" for _ in page_fids)
+            for fid, tot, done in db_conn.execute(f"""
+                SELECT file_id, COUNT(*), SUM(CASE WHEN status='received' THEN 1 ELSE 0 END)
+                FROM chunks
+                WHERE file_id IN ({placeholders})
+                GROUP BY file_id
+            """, tuple(page_fids)).fetchall():
+                chunk_progress[fid] = (tot or 0, done or 0)
+
+        rollback_check = history_conn.execute("""
+            SELECT 1 FROM transfer_history_files
+            WHERE session_token = ? AND pre_existed = 0 AND status IN ('completed', 'pending')
+            LIMIT 1
+        """, (session_token,)).fetchone()
 
     default_srv_ip = get_primary_local_ip()
     direction = (r[2] or 'pull').lower()
@@ -1824,7 +1881,9 @@ def api_get_session_detail(session_token):
     for fr in f_rows:
         fid = fr[1]
         f_status = fr[7]
-        tot_fc, done_fc = chunk_progress.get(fid, (1, 1 if f_status == 'completed' else 0))
+        f_size = fr[5] or 0
+        est_chunks = 1 if f_size == 0 else max(1, math.ceil(f_size / CHUNK_SIZE))
+        tot_fc, done_fc = chunk_progress.get(fid, (est_chunks, est_chunks if f_status == 'completed' else 0))
         files_list.append({
             "id": fr[0],
             "file_id": fid,
@@ -1832,7 +1891,7 @@ def api_get_session_detail(session_token):
             "source_path": fr[3] or fr[2],
             "name": os.path.basename(fr[2].rstrip('/')),
             "save_path": fr[4],
-            "size": fr[5] or 0,
+            "size": f_size,
             "mtime": fr[6],
             "status": f_status,
             "transferred_at": fr[8],
@@ -1841,11 +1900,10 @@ def api_get_session_detail(session_token):
             "chunks_done": done_fc
         })
 
+    total_pages = max(1, math.ceil(total_log_rows / per_page))
     can_resume = status in ('paused', 'interrupted') and (total_c > 0 and recv_c < total_c)
     can_cancel = status in ('active', 'paused', 'interrupted') and (recv_c < total_c)
-    can_rollback = status in ('active', 'paused', 'interrupted', 'completed', 'cancelled') and any(
-        f["status"] in ('completed', 'pending') and not f["pre_existed"] for f in files_list
-    )
+    can_rollback = status in ('active', 'paused', 'interrupted', 'completed', 'cancelled') and bool(rollback_check)
 
     session_obj = {
         "session_token": r[0],
@@ -1874,7 +1932,11 @@ def api_get_session_detail(session_token):
         "can_resume": can_resume,
         "can_cancel": can_cancel,
         "can_rollback": can_rollback,
-        "files": files_list
+        "files": files_list,
+        "page": page,
+        "per_page": per_page,
+        "total_pages": total_pages,
+        "total_file_rows": total_log_rows
     }
     return jsonify({"status": "success", "session": session_obj})
 
@@ -2042,30 +2104,20 @@ def get_progress():
         req_token = request.args.get('session_token') or current_active_token or get_meta('session_token')
         direction = 'pull'
         with db_lock:
-            if req_token:
-                cursor = db_conn.execute("""
-                    SELECT COUNT(*), SUM(CASE WHEN c.status='received' THEN 1 ELSE 0 END)
-                    FROM chunks c
-                    INNER JOIN files f ON c.file_id = f.file_id
-                    WHERE f.session_token = ?
-                """, (req_token,))
-            else:
-                cursor = db_conn.execute(
-                    "SELECT COUNT(*), SUM(CASE WHEN status='received' THEN 1 ELSE 0 END) FROM chunks"
-                )
-            row = cursor.fetchone()
-            total_chunks = row[0] or 0
-            received_chunks = row[1] or 0
-            pending_chunks = total_chunks - received_chunks
-
             state = get_meta('transfer_state', 'idle')
+            total_chunks = 0
+            received_chunks = 0
             if req_token:
-                s_row = history_conn.execute(
-                    "SELECT status, direction FROM transfer_sessions WHERE session_token=?", (req_token,)
-                ).fetchone()
+                s_row = history_conn.execute("""
+                    SELECT status, direction, total_chunks, received_chunks
+                    FROM transfer_sessions WHERE session_token=?
+                """, (req_token,)).fetchone()
                 if s_row:
                     state = s_row[0]
                     direction = (s_row[1] or 'pull').lower()
+                    total_chunks = s_row[2] or 0
+                    received_chunks = s_row[3] or 0
+            pending_chunks = max(0, total_chunks - received_chunks)
 
             if state == 'active' and total_chunks > 0 and pending_chunks == 0:
                 state = 'completed'
@@ -2087,7 +2139,7 @@ def get_progress():
                            (SELECT COUNT(*) FROM chunks c WHERE c.file_id = f.file_id AND c.status = 'received')
                     FROM files f
                     WHERE f.session_token = ?
-                      AND f.file_id IN (SELECT DISTINCT file_id FROM chunks WHERE status='pending')
+                      AND f.size > 0 AND f.file_id IN (SELECT DISTINCT file_id FROM chunks WHERE status='pending')
                     LIMIT 4
                 """, (req_token,))
             else:
@@ -2194,8 +2246,12 @@ def recv_json_line(sock, max_bytes=50 * 1024 * 1024):
 
 
 def handle_worker_stream(conn, worker_session_token):
-    """Receive compressed chunks from client worker socket during a PULL (Client -> Server) transfer."""
+    """Receive compressed chunks from client worker socket during a PULL (Client -> Server) transfer with O(1) DB updates."""
     global current_active_token
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
     dctx = zstd.ZstdDecompressor() if HAS_ZSTD else None
     with worker_conn_lock:
         active_worker_connections.add(conn)
@@ -2222,13 +2278,15 @@ def handle_worker_stream(conn, worker_session_token):
             file_id, chunk_index = meta["file_id"], meta["chunk_index"]
 
             with db_lock:
-                cursor = db_conn.execute(
-                    "SELECT session_token, relative_path, save_path, size FROM files WHERE file_id=?", (file_id,)
-                )
-                row = cursor.fetchone()
+                row = db_conn.execute(
+                    "SELECT session_token, relative_path, save_path, size, atime, mtime FROM files WHERE file_id=?",
+                    (file_id,)
+                ).fetchone()
                 if not row:
                     break
-                file_session_token, rel_path, saved_path, file_size = row[0], row[1], row[2], row[3] or 0
+                file_session_token, rel_path, saved_path, file_size, atime, mtime = (
+                    row[0], row[1], row[2], row[3] or 0, row[4], row[5]
+                )
                 s_row = history_conn.execute(
                     "SELECT status, destination_path FROM transfer_sessions WHERE session_token=?",
                     (file_session_token,)
@@ -2249,36 +2307,55 @@ def handle_worker_stream(conn, worker_session_token):
             all_done = False
             now_ts = time.time()
             with db_lock:
-                db_conn.execute(
-                    "UPDATE chunks SET status='received' WHERE file_id=? AND chunk_index=?",
+                upd = db_conn.execute(
+                    "UPDATE chunks SET status='received' WHERE file_id=? AND chunk_index=? AND status!='received'",
                     (file_id, chunk_index)
                 )
-                cursor = db_conn.execute(
+                chunk_newly_received = 1 if upd.rowcount > 0 else 0
+
+                pending_count = db_conn.execute(
                     "SELECT COUNT(*) FROM chunks WHERE file_id=? AND status='pending'",
                     (file_id,)
-                )
-                pending_count = cursor.fetchone()[0]
+                ).fetchone()[0]
+
+                file_newly_completed = 0
                 if pending_count == 0:
-                    cursor = db_conn.execute("SELECT atime, mtime FROM files WHERE file_id=?", (file_id,))
-                    atime, mtime = cursor.fetchone()
-                    history_conn.execute("""
+                    h_upd = history_conn.execute("""
                         UPDATE transfer_history_files
                         SET status = 'completed', transferred_at = ?
-                        WHERE session_token = ? AND relative_path = ?
+                        WHERE session_token = ? AND relative_path = ? AND status != 'completed'
                     """, (now_ts, file_session_token, rel_path))
+                    file_newly_completed = 1 if h_upd.rowcount > 0 else 0
 
-                cursor = db_conn.execute("""
-                    SELECT COUNT(*) FROM chunks c
-                    INNER JOIN files f ON c.file_id = f.file_id
-                    WHERE f.session_token = ? AND c.status = 'pending'
-                """, (file_session_token,))
-                total_pending = cursor.fetchone()[0]
-                if total_pending == 0:
+                # O(1) atomic counter increment on transfer_sessions (zero table scans!)
+                history_conn.execute("""
+                    UPDATE transfer_sessions
+                    SET updated_at = ?,
+                        received_chunks = received_chunks + ?,
+                        completed_files = completed_files + ?,
+                        transferred_bytes = transferred_bytes + ?
+                    WHERE session_token = ?
+                """, (
+                    now_ts,
+                    chunk_newly_received,
+                    file_newly_completed,
+                    file_size if file_newly_completed else 0,
+                    file_session_token
+                ))
+
+                sc_row = history_conn.execute("""
+                    SELECT completed_files, total_files, received_chunks, total_chunks
+                    FROM transfer_sessions WHERE session_token = ?
+                """, (file_session_token,)).fetchone()
+                comp_f = sc_row[0] if sc_row else 0
+                tot_f = sc_row[1] if sc_row else 0
+                recv_c = sc_row[2] if sc_row else 0
+                tot_c = sc_row[3] if sc_row else 0
+
+                if tot_c > 0 and recv_c >= tot_c:
                     set_meta('transfer_state', 'completed')
                     comp_f, tot_f, recv_c, tot_c = sync_session_metrics(file_session_token, override_status='completed')
                     all_done = True
-                else:
-                    comp_f, tot_f, recv_c, tot_c = sync_session_metrics(file_session_token)
 
             if pending_count == 0:
                 try:
@@ -2286,8 +2363,9 @@ def handle_worker_stream(conn, worker_session_token):
                 except Exception:
                     pass
                 release_file_lock(file_id)
-                with console_print_lock:
-                    print(f"[*] ⬅ Completed PULL direct-write transfer: {rel_path}")
+                if tot_f <= 100 or file_size >= 1024 * 1024 or comp_f % 50 == 0 or all_done:
+                    with console_print_lock:
+                        print(f"[*] ⬅ Completed PULL direct-write transfer ({comp_f}/{tot_f}): {rel_path}")
 
             if all_done:
                 finalize_db_wal()
@@ -2450,6 +2528,7 @@ def handle_client(conn, addr):
 
         # 4. PULL Transfer Session Initialization & Manifest Sync
         if verify_client_password_hash(recv_pwd_hash, client_ip=addr[0], client_id=client_id):
+            conn.settimeout(300.0)
             enable_db_wal()
             req_token = payload.get("session_token")
             routed_srv_ip = conn.getsockname()[0]
@@ -2469,6 +2548,7 @@ def handle_client(conn, addr):
                 "server_hostname": LOCAL_HOSTNAME,
                 "server_os": LOCAL_OS,
                 "server_ip": routed_srv_ip,
+                "server_has_zstd": HAS_ZSTD,
                 "destination_path": SAVE_DIRECTORY
             }) + "\n").encode('utf-8'))
 
@@ -2483,6 +2563,8 @@ def handle_client(conn, addr):
                 now_ts = time.time()
 
                 with db_lock:
+                    db_conn.execute("BEGIN IMMEDIATE")
+                    history_conn.execute("BEGIN IMMEDIATE")
                     sess_row = history_conn.execute(
                         "SELECT destination_path, title FROM transfer_sessions WHERE session_token=?", (token,)
                     ).fetchone()
@@ -2637,9 +2719,13 @@ def handle_client(conn, addr):
                     if (cursor.fetchone()[0] or 0) == 0:
                         set_meta('transfer_state', 'completed')
                         comp_f, tot_f, recv_c, tot_c = sync_session_metrics(token, override_status='completed')
+                        db_conn.execute("COMMIT")
+                        history_conn.execute("COMMIT")
                         finalize_db_wal()
                     else:
                         comp_f, tot_f, recv_c, tot_c = sync_session_metrics(token, override_status='active')
+                        db_conn.execute("COMMIT")
+                        history_conn.execute("COMMIT")
 
                 conn.sendall((json.dumps({
                     "status": "manifest_processed",
@@ -2650,6 +2736,7 @@ def handle_client(conn, addr):
                     "server_hostname": LOCAL_HOSTNAME,
                     "server_ip": routed_srv_ip,
                     "server_os": LOCAL_OS,
+                    "server_has_zstd": HAS_ZSTD,
                     "total_files": tot_f,
                     "completed_files": comp_f,
                     "total_chunks": tot_c,
