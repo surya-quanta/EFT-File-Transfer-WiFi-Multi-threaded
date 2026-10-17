@@ -14,6 +14,8 @@ import signal
 import atexit
 import platform
 import shutil
+import subprocess
+import ctypes
 from datetime import datetime
 from pathlib import PurePosixPath
 import zlib
@@ -985,10 +987,12 @@ def perform_pause(session_token=None):
 # ==============================================================================
 # SERVER-SIDE PUSH ENGINE (Server -> Client Producer & Worker Stream Handler)
 # ==============================================================================
-def process_and_compress_push_chunks(local_mapping, manifest, chunk_queue, missing_map):
+def process_and_compress_push_chunks(local_mapping, manifest, chunk_queue, missing_map, use_zstd=False):
     """Server-side producer thread that reads & compresses local missing chunks for PUSH transfer."""
     global push_transfer_active
-    cctx = zstd.ZstdCompressor(level=3) if HAS_ZSTD else None
+    can_use_zstd = bool(HAS_ZSTD and use_zstd)
+    cctx = zstd.ZstdCompressor(level=3) if can_use_zstd else None
+    comp_label = "zstd" if can_use_zstd else "zlib"
 
     for file_info in manifest.get("files", []):
         if not push_transfer_active:
@@ -1015,7 +1019,7 @@ def process_and_compress_push_chunks(local_mapping, manifest, chunk_queue, missi
                     raw_bytes = f.read(CHUNK_SIZE)
                     if not raw_bytes and file_info["size"] > 0:
                         break
-                    compressed = cctx.compress(raw_bytes) if HAS_ZSTD else zlib.compress(raw_bytes, level=1)
+                    compressed = cctx.compress(raw_bytes) if can_use_zstd else zlib.compress(raw_bytes, level=1)
                     while push_transfer_active:
                         try:
                             chunk_queue.put({
@@ -1024,6 +1028,7 @@ def process_and_compress_push_chunks(local_mapping, manifest, chunk_queue, missi
                                 "relative_path": rel_path,
                                 "file_size": file_info["size"],
                                 "chunk_index": chunk_index,
+                                "comp": comp_label,
                                 "data": compressed
                             }, timeout=0.5)
                             break
@@ -1032,7 +1037,7 @@ def process_and_compress_push_chunks(local_mapping, manifest, chunk_queue, missi
         except (PermissionError, OSError):
             continue
 
-    for _ in range(4):
+    for _ in range(12):
         try:
             chunk_queue.put(None, timeout=1.0)
         except Exception:
@@ -1237,12 +1242,15 @@ def handle_push_manifest_processed(msg):
             print(f"[*] PUSH Session '{sess_title}' ({token[:8]}) COMPLETED (all items up-to-date on client).")
         return
 
+    client_has_zstd = bool(
+        msg.get("has_zstd") if "has_zstd" in msg else (connected_client_info or {}).get("has_zstd", False)
+    )
     with push_transfer_lock:
         push_transfer_active = True
         push_work_queue = queue.Queue(maxsize=20)
         threading.Thread(
             target=process_and_compress_push_chunks,
-            args=(local_mapping, manifest, push_work_queue, missing_map),
+            args=(local_mapping, manifest, push_work_queue, missing_map, client_has_zstd),
             daemon=True
         ).start()
 
@@ -1279,7 +1287,7 @@ def handle_push_worker_stream(conn, worker_session_token):
             meta = {
                 "file_id": chunk["client_file_id"],
                 "chunk_index": chunk["chunk_index"],
-                "comp": "zstd" if HAS_ZSTD else "zlib"
+                "comp": chunk.get("comp", "zlib")
             }
             meta_bytes = json.dumps(meta).encode('utf-8')
             chunk_data = chunk["data"]
@@ -1338,9 +1346,11 @@ def handle_push_worker_stream(conn, worker_session_token):
                     )
 
             if all_done:
+                push_transfer_active = False
                 finalize_db_wal()
                 with console_print_lock:
                     print(f"[*] PUSH Session {worker_session_token[:8]} completed! WAL checkpointed and cleaned up.")
+                break
     except Exception:
         pass
     finally:
@@ -2336,6 +2346,7 @@ def handle_client(conn, addr):
                 "server_ip": routed_srv_ip,
                 "invite_port": payload.get("invite_port", DEFAULT_CLIENT_INVITE_PORT),
                 "requires_password": bool(recv_pwd_hash),
+                "has_zstd": bool(payload.get("has_zstd", False)),
                 "connected_at": time.time()
             }
             with control_socket_lock:
@@ -2779,7 +2790,7 @@ def interactive_history_viewer():
 
         if viewing_session_token is None:
             print(border)
-            print(" ⚡ EFT v3.0 SERVER — TRANSFER HISTORY VIEWER (transfer_history.db)")
+            print(" ⚡ EFT v3.1 SERVER — TRANSFER HISTORY VIEWER (transfer_history.db)")
             print(border)
 
             if not sessions:
@@ -2971,9 +2982,102 @@ def handle_ctrl_c_interrupt():
         server_running = False
 
 
+def ensure_os_network_and_av_readiness():
+    """
+    Cross-platform network & antivirus readiness helper:
+    - Windows:
+      1. Automatically switches any active 'Public' network profile to 'Private' via Set-NetConnectionProfile.
+      2. Removes any pre-existing Windows Firewall 'Block' rules on python.exe (which override Allow rules!).
+      3. Adds explicit Inbound Allow rules for TCP (8080, 8081), UDP (8082), and python.exe across all profiles.
+    - Linux: Detects active UFW or firewalld and opens ports 8080-8084 if needed.
+    - Android: Acquires termux-wake-lock if running inside Termux so Wi-Fi never sleeps mid-transfer.
+    """
+    if LOCAL_OS == 'windows':
+        rule_name = "EFT_Server_v3_Inbound_Ready"
+        py_exe = os.path.abspath(sys.executable)
+        save_dir_clean = os.path.abspath(SAVE_DIRECTORY)
+
+        needs_config = True
+        try:
+            chk_ps = (
+                f'$r = Get-NetFirewallRule -DisplayName "{rule_name}" -ErrorAction SilentlyContinue; '
+                f'$pub = Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object {{ $_.NetworkCategory -eq "Public" }}; '
+                f'$blk = Get-NetFirewallApplicationFilter -Program "{py_exe}" -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Action -eq "Block" }}; '
+                f'if ($r -and (-not $pub) -and (-not $blk)) {{ Write-Output "READY" }}'
+            )
+            chk = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", chk_ps],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4.0
+            )
+            if "READY" in (chk.stdout or ""):
+                needs_config = False
+        except Exception:
+            pass
+
+        if needs_config:
+            print("[*] Windows Network Security: Switching Public profile to Private & clearing Python firewall blocks...")
+            ps_script = (
+                "Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object { $_.NetworkCategory -eq 'Public' } | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue; "
+                "Get-NetFirewallRule -Action Block -Enabled True -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'python' } | Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
+                f"Get-NetFirewallApplicationFilter -Program '{py_exe}' -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Action -eq 'Block' }} | Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
+                f"netsh advfirewall firewall delete rule name=\"{rule_name}\" >$null 2>&1; "
+                f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow protocol=TCP localport={PORT},{WEB_PORT} profile=any enable=yes >$null 2>&1; "
+                f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow protocol=UDP localport={DISCOVERY_UDP_PORT} profile=any enable=yes >$null 2>&1; "
+                f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow program=\"{py_exe}\" profile=any enable=yes >$null 2>&1; "
+                f"Add-MpPreference -ExclusionPath '{save_dir_clean}' -ErrorAction SilentlyContinue"
+            )
+
+            try:
+                is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                is_admin = False
+
+            if is_admin:
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print("[*] Windows Network Security: Wi-Fi set to Private, Block rules removed, and EFT ports opened.")
+            else:
+                print("[*] Windows Security: Please click 'Yes' on the UAC prompt to switch Wi-Fi to Private and unblock ports...")
+                try:
+                    ret = ctypes.windll.shell32.ShellExecuteW(
+                        None, "runas", "powershell.exe", f'-NoProfile -ExecutionPolicy Bypass -Command "{ps_script}"', None, 1
+                    )
+                    if int(ret) > 32:
+                        time.sleep(2.2)
+                        print("[*] Windows Network Security: Wi-Fi profile switched to Private and firewall rules applied.")
+                    else:
+                        print("[!] Windows Security: UAC declined. Incoming connections on Public Wi-Fi may time out.")
+                except Exception as e:
+                    print(f"[!] Windows Security auto-configuration skipped: {e}")
+
+    elif LOCAL_OS == 'linux':
+        try:
+            if shutil.which("ufw"):
+                ufw_st = subprocess.run("ufw status", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if "Status: active" in (ufw_st.stdout or "") and str(PORT) not in (ufw_st.stdout or ""):
+                    print(f"[*] Linux UFW active: Opening EFT ports {PORT}:8084 (may prompt for sudo)...")
+                    subprocess.run(f"sudo ufw allow {PORT}:8084/tcp && sudo ufw allow {PORT}:8084/udp", shell=True)
+            elif shutil.which("firewall-cmd"):
+                fw_st = subprocess.run("firewall-cmd --state", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if "running" in (fw_st.stdout or "").lower():
+                    ports_chk = subprocess.run("firewall-cmd --list-ports", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if f"{PORT}/tcp" not in (ports_chk.stdout or ""):
+                        print(f"[*] Linux firewalld active: Opening EFT ports {PORT}-8084...")
+                        subprocess.run(f"sudo firewall-cmd --add-port={PORT}-8084/tcp --add-port={PORT}-8084/udp", shell=True)
+        except Exception:
+            pass
+
+    elif LOCAL_OS == 'android':
+        if shutil.which("termux-wake-lock"):
+            try:
+                subprocess.run("termux-wake-lock", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+
 def start_server():
     global server_running
     server_running = True
+    ensure_os_network_and_av_readiness()
     threading.Thread(target=start_web_server, daemon=True).start()
     threading.Thread(target=discovery_listener_loop, daemon=True).start()
 
@@ -2990,7 +3094,7 @@ def start_server():
 
     ips_str = ", ".join(get_local_ips())
     print("\n" + "=" * 78)
-    print(f"[*] EFT Two-Way High-Speed Server v3.0 online ({LOCAL_OS.upper()} - {LOCAL_HOSTNAME})")
+    print(f"[*] EFT Two-Way High-Speed Server v3.1 online ({LOCAL_OS.upper()} - {LOCAL_HOSTNAME})")
     print(f"[*] Server Local IPs : {ips_str}")
     print(f"[*] Socket Port      : {PORT} | Web UI: http://127.0.0.1:{WEB_PORT}")
     print(f"[*] Client curl URL  : curl http://{get_primary_local_ip()}:{WEB_PORT}/download/client.py -o client.py")
@@ -3022,14 +3126,14 @@ def start_server():
 
 
 def run_startup_menu():
-    """Interactive numerical startup menu for EFT Server v3.0."""
+    """Interactive numerical startup menu for EFT Server v3.1."""
     if "--no-menu" in sys.argv:
         start_server()
         return
 
     while True:
         print("\n" + "=" * 68)
-        print(f" ⚡ EFFICIENT FILE TRANSFER (EFT) v3.0 — SERVER ({LOCAL_HOSTNAME} | {LOCAL_OS.upper()})")
+        print(f" ⚡ EFFICIENT FILE TRANSFER (EFT) v3.1 — SERVER ({LOCAL_HOSTNAME} | {LOCAL_OS.upper()})")
         print("=" * 68)
         print("  1. Start EFT Server (Two-Way Engine + Web UI on port 8081)")
         print("  2. Read Old Transfer History (Arrow-Key Viewer)")
