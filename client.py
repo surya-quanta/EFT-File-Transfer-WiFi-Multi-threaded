@@ -328,6 +328,10 @@ def init_client_db():
         WHERE status = 'active' AND received_chunks < total_chunks
     """, (time.time(),))
 
+    sconn.execute("CREATE INDEX IF NOT EXISTS idx_cfiles_session ON files(session_token)")
+    sconn.execute("CREATE INDEX IF NOT EXISTS idx_cchunks_file_status ON chunks(file_id, status)")
+    hconn.execute("CREATE INDEX IF NOT EXISTS idx_chist_files_session ON transfer_history_files(session_token)")
+
     for c in (sconn, hconn):
         c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
         c.execute('PRAGMA journal_mode=DELETE')
@@ -424,6 +428,7 @@ def record_client_session_init(token, title, target_paths, dest_path, srv_name, 
     completed_set = set(already_completed or [])
 
     with db_lock:
+        history_conn.execute("BEGIN IMMEDIATE")
         existing = history_conn.execute(
             "SELECT started_at FROM transfer_sessions WHERE session_token=?", (token,)
         ).fetchone()
@@ -491,6 +496,7 @@ def record_client_session_init(token, title, target_paths, dest_path, srv_name, 
             ))
 
         sync_client_session_progress(token, recv_chunks, tot_chunks, override_status=init_status)
+        history_conn.execute("COMMIT")
 
 
 def sync_client_session_progress(token, received_chunks=None, total_chunks=None, override_status=None):
@@ -897,9 +903,11 @@ def recv_json_line(sock, max_bytes=50 * 1024 * 1024):
 # ==============================================================================
 # 1. PULL ENGINE (Client -> Server): Producer-Consumer Chunk Pipeline
 # ==============================================================================
-def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_map):
+def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_map, use_zstd=True):
     global transfer_active
-    cctx = zstd.ZstdCompressor(level=3) if HAS_ZSTD else None
+    can_use_zstd = bool(HAS_ZSTD and use_zstd)
+    cctx = zstd.ZstdCompressor(level=3) if can_use_zstd else None
+    comp_label = "zstd" if can_use_zstd else "zlib"
 
     for file_info in manifest["files"]:
         if not transfer_active:
@@ -924,7 +932,7 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
                     raw_bytes = f.read(CHUNK_SIZE)
                     if not raw_bytes and file_info["size"] > 0:
                         break
-                    compressed = cctx.compress(raw_bytes) if HAS_ZSTD else zlib.compress(raw_bytes, level=1)
+                    compressed = cctx.compress(raw_bytes) if can_use_zstd else zlib.compress(raw_bytes, level=1)
                     while transfer_active:
                         try:
                             chunk_queue.put({
@@ -932,6 +940,7 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
                                 "relative_path": rel_path,
                                 "file_size": file_info["size"],
                                 "chunk_index": chunk_index,
+                                "comp": comp_label,
                                 "data": compressed
                             }, timeout=0.5)
                             break
@@ -940,7 +949,7 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
         except (PermissionError, OSError):
             continue
 
-    for _ in range(4):
+    for _ in range(12):
         try:
             chunk_queue.put(None, timeout=1.0)
         except Exception:
@@ -950,7 +959,11 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
 def network_worker(worker_id, chunk_queue, session_token, server_ip, server_port, srv_name):
     global transfer_active
     worker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    worker_socket.settimeout(25.0)
+    worker_socket.settimeout(30.0)
+    try:
+        worker_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except Exception:
+        pass
     try:
         worker_socket.connect((server_ip, server_port))
         auth = {"action": "worker_auth", "session_token": session_token}
@@ -973,7 +986,7 @@ def network_worker(worker_id, chunk_queue, session_token, server_ip, server_port
             meta = {
                 "file_id": chunk["file_id"],
                 "chunk_index": chunk["chunk_index"],
-                "comp": "zstd" if HAS_ZSTD else "zlib"
+                "comp": chunk.get("comp", "zstd" if HAS_ZSTD else "zlib")
             }
             meta_bytes = json.dumps(meta).encode('utf-8')
             chunk_data = chunk["data"]
@@ -989,10 +1002,10 @@ def network_worker(worker_id, chunk_queue, session_token, server_ip, server_port
             if isinstance(ack_msg, dict):
                 rel_p = ack_msg.get("relative_path") or chunk.get("relative_path", "")
                 f_size = ack_msg.get("file_size", chunk.get("file_size", 0))
-                recv_c = ack_msg.get("received_chunks")
-                tot_c = ack_msg.get("total_chunks")
-                comp_f = ack_msg.get("completed_files", 0)
-                tot_f = ack_msg.get("total_files", 0)
+                recv_c = ack_msg.get("received_chunks") or 0
+                tot_c = ack_msg.get("total_chunks") or 0
+                comp_f = ack_msg.get("completed_files") or 0
+                tot_f = ack_msg.get("total_files") or 0
                 sess_done = bool(ack_msg.get("session_completed", False))
 
                 if ack_msg.get("file_completed"):
@@ -1003,25 +1016,39 @@ def network_worker(worker_id, chunk_queue, session_token, server_ip, server_port
                             SET status = 'completed', transferred_at = ?
                             WHERE session_token = ? AND relative_path = ?
                         """, (done_ts, session_token, rel_p))
-                        sync_client_session_progress(
-                            session_token,
-                            received_chunks=recv_c,
-                            total_chunks=tot_c,
-                            override_status='completed' if sess_done else 'active'
-                        )
-                    pct = round((recv_c / tot_c * 100), 1) if (tot_c and recv_c is not None) else 100.0
-                    ts_str = format_ts_human(done_ts)
-                    with console_print_lock:
-                        print(
-                            f"[{ts_str}] ⬅ Pulled {rel_p} ({format_bytes_human(f_size)}) "
-                            f"[{comp_f}/{tot_f} files | {pct}%] -> Server {srv_name} ({server_ip})"
-                        )
-                elif recv_c is not None and tot_c is not None:
+                        if sess_done:
+                            sync_client_session_progress(
+                                session_token,
+                                received_chunks=recv_c,
+                                total_chunks=tot_c,
+                                override_status='completed'
+                            )
+                        else:
+                            # Fast O(1) primary-key update without scanning 11,243 rows!
+                            history_conn.execute("""
+                                UPDATE transfer_sessions
+                                SET updated_at = ?,
+                                    completed_files = ?,
+                                    received_chunks = ?,
+                                    transferred_bytes = transferred_bytes + ?
+                                WHERE session_token = ?
+                            """, (done_ts, comp_f, recv_c, f_size, session_token))
+
+                    # Throttle console prints on huge batches of tiny files so terminal I/O never stalls sockets
+                    if tot_f <= 100 or f_size >= 1024 * 1024 or comp_f % 50 == 0 or sess_done:
+                        pct = round((recv_c / tot_c * 100), 1) if tot_c else 100.0
+                        ts_str = format_ts_human(done_ts)
+                        with console_print_lock:
+                            print(
+                                f"[{ts_str}] ⬅ Pulled {rel_p} ({format_bytes_human(f_size)}) "
+                                f"[{comp_f}/{tot_f} files | {pct}%] -> Server {srv_name} ({server_ip})"
+                            )
+                elif sess_done:
                     sync_client_session_progress(
                         session_token,
                         received_chunks=recv_c,
                         total_chunks=tot_c,
-                        override_status='completed' if sess_done else None
+                        override_status='completed'
                     )
     except Exception:
         pass
@@ -1492,7 +1519,7 @@ def execute_transfer(target_paths, requested_session_token=None, session_meta=No
 
         enable_db_wal()
         t_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        t_sock.settimeout(30.0)
+        t_sock.settimeout(300.0)
         try:
             t_sock.connect((active_server_ip, active_server_port))
             init_auth = {
@@ -1517,11 +1544,18 @@ def execute_transfer(target_paths, requested_session_token=None, session_meta=No
             srv_os = resp.get("server_os") or session_meta.get("server_os") or active_server_os
             srv_ip = resp.get("server_ip") or session_meta.get("server_ip") or active_server_ip
             dest_path = resp.get("destination_path") or session_meta.get("destination_path") or ""
+            server_has_zstd = bool(resp.get("server_has_zstd", True))
 
             payload = {"action": "init_transfer", "session_token": token, "manifest": file_manifest}
             t_sock.sendall((json.dumps(payload) + "\n").encode('utf-8'))
 
-            server_response = recv_json_line(t_sock) or {}
+            server_response = recv_json_line(t_sock)
+            if not server_response or server_response.get("status") != "manifest_processed":
+                print("[!] Server timed out or disconnected while pre-allocating manifest files.")
+                transfer_active = False
+                finalize_db_wal()
+                return
+
             missing_map = server_response.get("missing_map", {})
             already_completed = server_response.get("already_completed", [])
             dest_path = server_response.get("destination_path") or dest_path
@@ -1529,6 +1563,8 @@ def execute_transfer(target_paths, requested_session_token=None, session_meta=No
             srv_name = server_response.get("server_hostname") or srv_name
             srv_ip = server_response.get("server_ip") or srv_ip
             srv_os = server_response.get("server_os") or srv_os
+            if "server_has_zstd" in server_response:
+                server_has_zstd = bool(server_response.get("server_has_zstd"))
             tot_chunks = server_response.get("total_chunks", 0)
             recv_chunks = server_response.get("received_chunks", 0)
         except Exception as e:
@@ -1585,7 +1621,7 @@ def execute_transfer(target_paths, requested_session_token=None, session_meta=No
         work_queue = queue.Queue(maxsize=20)
         producer_thread = threading.Thread(
             target=process_and_compress_chunks,
-            args=(local_mapping, file_manifest, work_queue, missing_map),
+            args=(local_mapping, file_manifest, work_queue, missing_map, server_has_zstd),
             daemon=True
         )
         producer_thread.start()
