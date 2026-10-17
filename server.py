@@ -100,12 +100,23 @@ def get_primary_local_ip():
 
 
 def get_broadcast_targets():
-    """Return 255.255.255.255, 127.0.0.1, and directed subnet broadcasts (x.x.x.255) for all local NICs."""
+    """Return 255.255.255.255, 127.0.0.1, directed subnet broadcasts (x.x.x.255), and active ARP table peers."""
     targets = {'255.255.255.255', '127.0.0.1'}
     for ip in get_local_ips():
         parts = ip.split('.')
         if len(parts) == 4 and not ip.startswith('127.'):
             targets.add(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
+            targets.add(f"{parts[0]}.{parts[1]}.{parts[2]}.1")
+    # Also read the OS ARP table so hotspot/tethered peers receive direct unicast UDP probes
+    try:
+        arp_out = subprocess.check_output(['arp', '-a'], stderr=subprocess.DEVNULL, text=True, timeout=1.0)
+        for token in arp_out.replace('(', ' ').replace(')', ' ').split():
+            parts = token.split('.')
+            if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+                if not token.startswith(('127.', '224.', '239.', '255.')):
+                    targets.add(token)
+    except Exception:
+        pass
     return sorted(targets)
 
 
@@ -1261,11 +1272,12 @@ def handle_push_manifest_processed(msg):
             daemon=True
         ).start()
 
-    # Notify client that the server's push_work_queue is ready for the 4 push_worker_auth connections
+    # Notify client that the server's push_work_queue is ready AND spawn outbound server->client workers
     send_control_command({
         "action": "start_push_workers",
         "session_token": token
     })
+    threading.Thread(target=spawn_server_outbound_workers, args=(token, "push"), daemon=True).start()
 
 
 def handle_push_worker_stream(conn, worker_session_token):
@@ -1461,10 +1473,383 @@ def send_udp_probe():
             pass
 
 
+def promote_socket_to_control_channel(conn, addr_ip, payload):
+    """
+    Promote an already-authenticated socket (either inbound on 8080 or outbound invite on 8083)
+    into the persistent global_control_socket and start its reader thread.
+    """
+    global global_control_socket, connected_client_info, peer_connection_seq
+    conn.settimeout(None)
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except Exception:
+        pass
+
+    try:
+        routed_srv_ip = conn.getsockname()[0]
+    except Exception:
+        routed_srv_ip = get_primary_local_ip()
+    if routed_srv_ip.startswith('127.') or routed_srv_ip == '0.0.0.0':
+        routed_srv_ip = get_primary_local_ip()
+
+    client_id = payload.get("client_id")
+    recv_pwd_hash = payload.get("password_hash", "")
+    c_info = {
+        "client_id": client_id or f"{addr_ip}:{payload.get('invite_port', DEFAULT_CLIENT_INVITE_PORT)}",
+        "hostname": payload.get("hostname") or "Remote-Client",
+        "os": (payload.get("os") or "unknown").lower(),
+        "ip": addr_ip,
+        "server_ip": routed_srv_ip,
+        "invite_port": payload.get("invite_port", DEFAULT_CLIENT_INVITE_PORT),
+        "requires_password": bool(recv_pwd_hash),
+        "has_zstd": bool(payload.get("has_zstd", False)),
+        "connected_at": time.time()
+    }
+    with control_socket_lock:
+        if global_control_socket and global_control_socket is not conn:
+            try:
+                global_control_socket.close()
+            except Exception:
+                pass
+        global_control_socket = conn
+        connected_client_info = c_info
+        peer_connection_seq += 1
+
+    print(f"[*] Client connected: {c_info['hostname']} ({addr_ip}) [OS: {c_info['os'].upper()}]")
+    return c_info, routed_srv_ip
+
+def process_pull_manifest_dict(manifest_payload, addr_ip):
+    """
+    Process a PULL manifest (either from control channel or dedicated socket),
+    pre-allocate files in a single fast SQLite transaction, and return the response dict.
+    """
+    global current_active_token
+    enable_db_wal()
+    manifest_data = manifest_payload.get("manifest") or {}
+    files = manifest_data.get("files", [])
+    empty_dirs = manifest_data.get("dirs", [])
+    token = manifest_payload.get("session_token") or current_active_token or secrets.token_hex(16)
+    missing_map = {}
+    already_completed_files = []
+    now_ts = time.time()
+    routed_srv_ip = (connected_client_info or {}).get("server_ip") or get_primary_local_ip()
+
+    with db_lock:
+        active_sessions.add(token)
+        current_active_token = token
+        set_meta('session_token', token)
+        set_meta('transfer_state', 'active')
+
+        db_conn.execute("BEGIN IMMEDIATE")
+        history_conn.execute("BEGIN IMMEDIATE")
+        sess_row = history_conn.execute(
+            "SELECT destination_path, title FROM transfer_sessions WHERE session_token=?", (token,)
+        ).fetchone()
+        base_save_dir = sess_row[0] if (sess_row and sess_row[0]) else SAVE_DIRECTORY
+        sess_title = sess_row[1] if (sess_row and sess_row[1]) else "Transfer Session"
+
+        c_id = (connected_client_info or {}).get("client_id") or manifest_payload.get("client_id") or ""
+        c_name = (connected_client_info or {}).get("hostname") or manifest_payload.get("hostname") or "Remote Client"
+        c_ip = (connected_client_info or {}).get("ip") or addr_ip
+        c_os = (connected_client_info or {}).get("os") or manifest_payload.get("os") or "unknown"
+
+        if not sess_row:
+            history_conn.execute("""
+                INSERT INTO transfer_sessions (
+                    session_token, title, direction,
+                    server_name, server_ip, server_os,
+                    client_id, client_name, client_ip, client_os,
+                    source_paths, destination_path, started_at, updated_at, status
+                ) VALUES (?, ?, 'pull', ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, 'active')
+            """, (
+                token, sess_title,
+                LOCAL_HOSTNAME, routed_srv_ip, LOCAL_OS,
+                c_id, c_name, c_ip, c_os,
+                base_save_dir, now_ts, now_ts
+            ))
+        else:
+            history_conn.execute("""
+                UPDATE transfer_sessions
+                SET direction = 'pull',
+                    server_name = ?, server_ip = ?, server_os = ?,
+                    client_id = COALESCE(NULLIF(?, ''), client_id),
+                    client_name = COALESCE(NULLIF(?, ''), client_name),
+                    client_ip = COALESCE(NULLIF(?, ''), client_ip),
+                    client_os = COALESCE(NULLIF(?, ''), client_os)
+                WHERE session_token = ?
+            """, (LOCAL_HOSTNAME, routed_srv_ip, LOCAL_OS, c_id, c_name, c_ip, c_os, token))
+
+        for dir_info in empty_dirs:
+            norm_dir = normalize_rel_path(dir_info.get("relative_path", ""))
+            if not norm_dir:
+                continue
+            dir_save_path = resolve_local_save_path(base_save_dir, norm_dir)
+            dir_pre_existed = 1 if os.path.exists(dir_save_path) else 0
+            os.makedirs(dir_save_path, exist_ok=True)
+            try:
+                os.utime(dir_save_path, (dir_info.get("atime", now_ts), dir_info.get("mtime", now_ts)))
+            except Exception:
+                pass
+
+            dir_rel_display = norm_dir.rstrip('/') + '/'
+            history_conn.execute("""
+                INSERT INTO transfer_history_files (
+                    session_token, file_id, relative_path, source_path, save_path, size,
+                    mtime, atime, pre_existed, status, transferred_at
+                ) VALUES (?, 0, ?, ?, ?, 0, ?, ?, ?, 'completed', ?)
+                ON CONFLICT(session_token, relative_path) DO UPDATE SET
+                    save_path = excluded.save_path,
+                    status = 'completed',
+                    transferred_at = COALESCE(transfer_history_files.transferred_at, excluded.transferred_at)
+            """, (
+                token, dir_rel_display, dir_info.get("source_path") or norm_dir,
+                dir_save_path, dir_info.get("mtime", now_ts), dir_info.get("atime", now_ts),
+                dir_pre_existed, now_ts
+            ))
+
+        for file_info in files:
+            norm_rel = normalize_rel_path(file_info["relative_path"])
+            src_full_path = file_info.get("source_path") or norm_rel
+            final_path = resolve_local_save_path(base_save_dir, norm_rel)
+            os.makedirs(os.path.dirname(final_path), exist_ok=True)
+
+            cursor = db_conn.execute(
+                'SELECT file_id, save_path, pre_existed FROM files WHERE session_token=? AND relative_path=? AND size=?',
+                (token, norm_rel, file_info["size"])
+            )
+            existing = cursor.fetchone()
+            if existing:
+                file_id = existing[0]
+                if existing[1]:
+                    final_path = existing[1]
+                pre_existed = existing[2]
+            else:
+                pre_existed = 1 if (os.path.exists(final_path) and os.path.getsize(final_path) == file_info["size"]) else 0
+                cursor = db_conn.execute(
+                    """INSERT INTO files (session_token, relative_path, source_path, save_path, size, mtime, atime, pre_existed)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (token, norm_rel, src_full_path, final_path, file_info["size"], file_info["mtime"], file_info["atime"], pre_existed)
+                )
+                file_id = cursor.lastrowid
+                if file_info["size"] == 0:
+                    db_conn.execute(
+                        "INSERT INTO chunks (file_id, chunk_index, status) VALUES (?, 0, 'received')",
+                        (file_id,)
+                    )
+                else:
+                    total_chunks = max(1, math.ceil(file_info["size"] / CHUNK_SIZE))
+                    for i in range(total_chunks):
+                        db_conn.execute(
+                            "INSERT INTO chunks (file_id, chunk_index, status) VALUES (?, ?, 'pending')",
+                            (file_id, i)
+                        )
+
+            if not os.path.exists(final_path):
+                with open(final_path, 'wb') as f:
+                    if file_info["size"] > 0:
+                        f.truncate(file_info["size"])
+                if file_info["size"] == 0:
+                    try:
+                        os.utime(final_path, (file_info["atime"], file_info["mtime"]))
+                    except Exception:
+                        pass
+
+            cursor = db_conn.execute(
+                "SELECT chunk_index FROM chunks WHERE file_id=? AND status='pending'",
+                (file_id,)
+            )
+            missing_chunks = [row[0] for row in cursor.fetchall()]
+            file_status = 'completed' if len(missing_chunks) == 0 else 'pending'
+            file_done_ts = now_ts if file_status == 'completed' else None
+
+            history_conn.execute("""
+                INSERT INTO transfer_history_files (
+                    session_token, file_id, relative_path, source_path, save_path, size,
+                    mtime, atime, pre_existed, status, transferred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_token, relative_path) DO UPDATE SET
+                    file_id = excluded.file_id,
+                    source_path = excluded.source_path,
+                    save_path = excluded.save_path,
+                    status = CASE WHEN transfer_history_files.status = 'completed' THEN 'completed' ELSE excluded.status END,
+                    transferred_at = COALESCE(transfer_history_files.transferred_at, excluded.transferred_at)
+            """, (
+                token, file_id, norm_rel, src_full_path, final_path, file_info["size"],
+                file_info["mtime"], file_info["atime"], pre_existed, file_status, file_done_ts
+            ))
+
+            if missing_chunks:
+                missing_map[norm_rel] = {
+                    "file_id": file_id,
+                    "missing": missing_chunks,
+                    "save_path": final_path
+                }
+            else:
+                already_completed_files.append(norm_rel)
+
+        cursor = db_conn.execute("""
+            SELECT COUNT(*) FROM chunks c
+            INNER JOIN files f ON c.file_id = f.file_id
+            WHERE f.session_token = ? AND c.status = 'pending'
+        """, (token,))
+        if (cursor.fetchone()[0] or 0) == 0:
+            set_meta('transfer_state', 'completed')
+            comp_f, tot_f, recv_c, tot_c = sync_session_metrics(token, override_status='completed')
+            db_conn.execute("COMMIT")
+            history_conn.execute("COMMIT")
+            finalize_db_wal()
+        else:
+            comp_f, tot_f, recv_c, tot_c = sync_session_metrics(token, override_status='active')
+            db_conn.execute("COMMIT")
+            history_conn.execute("COMMIT")
+
+    return {
+        "action": "pull_manifest_processed",
+        "status": "manifest_processed",
+        "session_token": token,
+        "missing_map": missing_map,
+        "already_completed": already_completed_files,
+        "destination_path": base_save_dir,
+        "session_title": sess_title,
+        "server_hostname": LOCAL_HOSTNAME,
+        "server_ip": routed_srv_ip,
+        "server_os": LOCAL_OS,
+        "server_has_zstd": HAS_ZSTD,
+        "total_files": tot_f,
+        "completed_files": comp_f,
+        "total_chunks": tot_c,
+        "received_chunks": recv_c
+    }
+
+
+def spawn_server_outbound_workers(session_token, mode="pull"):
+    """
+    Connect 4 worker sockets OUTBOUND from Server -> Client's invite_port (8083).
+    Because Server -> Client (8083) is the exact direction that established the Control Channel,
+    this guarantees 4 high-speed worker streams even if Windows Firewall or Android Hotspot blocks Server port 8080!
+    """
+    time.sleep(0.4)
+    if session_token not in active_sessions:
+        return
+    with worker_conn_lock:
+        if len(active_worker_connections) >= 2:
+            return
+
+    c_info = connected_client_info or {}
+    client_ip = c_info.get("ip")
+    invite_port = int(c_info.get("invite_port") or DEFAULT_CLIENT_INVITE_PORT)
+    if not client_ip:
+        return
+
+    def _outbound_worker(wid):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10.0)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.connect((client_ip, invite_port))
+            req = {
+                "action": "reverse_worker_connect",
+                "mode": mode,
+                "session_token": session_token,
+                "password_hash": active_client_password_hash
+            }
+            s.sendall((json.dumps(req) + "\n").encode('utf-8'))
+            ack = s.recv(1024).decode('utf-8', errors='replace').strip()
+            if "success" not in ack:
+                s.close()
+                return
+            s.settimeout(30.0)
+            if mode == "push":
+                handle_push_worker_stream(s, session_token)
+            else:
+                handle_worker_stream(s, session_token)
+        except Exception:
+            pass
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    for i in range(4):
+        threading.Thread(target=_outbound_worker, args=(i + 1,), daemon=True).start()
+
+def run_server_control_reader(conn, addr_ip):
+    """Persistent reader loop for global_control_socket (resilient to malformed JSON lines)."""
+    global global_control_socket, connected_client_info, last_dir_result, current_active_token
+    buffer = bytearray()
+    while server_running:
+        try:
+            data = conn.recv(65536)
+            if not data:
+                break
+            buffer.extend(data)
+            while b'\n' in buffer:
+                nl = buffer.find(b'\n')
+                line_bytes = bytes(buffer[:nl]).strip()
+                del buffer[:nl + 1]
+                if not line_bytes:
+                    continue
+                try:
+                    msg = json.loads(line_bytes.decode('utf-8', errors='replace'))
+                except Exception as je:
+                    print(f"[!] Control channel ignored malformed JSON frame: {je}")
+                    continue
+
+                m_act = msg.get("action")
+                if m_act == "dir_result":
+                    last_dir_result = msg
+                    dir_result_event.set()
+                elif m_act == "init_transfer":
+                    def _handle_ctrl_pull_init(m_payload):
+                        resp_dict = process_pull_manifest_dict(m_payload, addr_ip)
+                        send_control_command(resp_dict)
+                        if resp_dict.get("missing_map"):
+                            spawn_server_outbound_workers(resp_dict["session_token"], mode="pull")
+                    threading.Thread(target=_handle_ctrl_pull_init, args=(msg,), daemon=True).start()
+                elif m_act == "push_manifest_processed":
+                    threading.Thread(
+                        target=handle_push_manifest_processed,
+                        args=(msg,),
+                        daemon=True
+                    ).start()
+                elif m_act == "transfer_interrupted":
+                    tok = msg.get("session_token") or current_active_token
+                    stop_push_workers()
+                    with db_lock:
+                        set_meta('transfer_state', 'interrupted')
+                        if tok:
+                            sync_session_metrics(tok, override_status='interrupted')
+                    finalize_db_wal()
+        except Exception:
+            break
+
+    stop_push_workers()
+    with control_socket_lock:
+        if global_control_socket is conn:
+            global_control_socket = None
+            connected_client_info = None
+    print(f"[*] Client control channel disconnected ({addr_ip}).")
+    with db_lock:
+        if current_active_token:
+            cursor = db_conn.execute("""
+                SELECT COUNT(*) FROM chunks c
+                INNER JOIN files f ON c.file_id = f.file_id
+                WHERE f.session_token = ? AND c.status = 'pending'
+            """, (current_active_token,))
+            if (cursor.fetchone()[0] or 0) > 0:
+                set_meta('transfer_state', 'interrupted')
+                sync_session_metrics(current_active_token, override_status='interrupted')
+    finalize_db_wal()
+
+
 def invite_waiting_client(client_ip, invite_port=DEFAULT_CLIENT_INVITE_PORT, udp_port=None, password_hash=""):
     """
-    Invite a waiting client to connect to this server using the client-configured password hash.
-    Returns (status_code, message) where status_code is 'ok', 'auth_failed', or 'unreachable'.
+    Invite a waiting client to connect to this server.
+    UPGRADE: If the TCP connection to the client's invite_port succeeds and the client replies with
+    'control_ready' JSON, we immediately promote THAT SAME TCP SOCKET into the persistent control channel!
+    This completely bypasses any Windows Firewall or Android Hotspot routing blocks on port 8080!
     """
     invite_payload = {
         "action": "connect_to_server",
@@ -1472,22 +1857,44 @@ def invite_waiting_client(client_ip, invite_port=DEFAULT_CLIENT_INVITE_PORT, udp
         "server_hostname": LOCAL_HOSTNAME,
         "server_os": LOCAL_OS,
         "server_ips": get_local_ips(),
-        "password_hash": password_hash or ""
+        "password_hash": password_hash or "",
+        "upgrade_socket": True
     }
 
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3.0)
+        s.settimeout(4.0)
         s.connect((client_ip, int(invite_port)))
         routed_server_ip = s.getsockname()[0]
         invite_payload["preferred_server_ip"] = routed_server_ip
         s.sendall((json.dumps(invite_payload) + "\n").encode('utf-8'))
-        resp = s.recv(1024).decode('utf-8', errors='replace').strip()
-        s.close()
 
-        if "auth_failed" in resp or "rejected" in resp:
+        resp_line = s.recv(4096).decode('utf-8', errors='replace').strip()
+        if "auth_failed" in resp_line or "rejected" in resp_line:
+            s.close()
             return "auth_failed", "Incorrect password rejected by client."
-        if "connecting" in resp or "success" in resp:
+
+        # Check if the client sent back a JSON control_auth upgrade on the same socket
+        try:
+            resp_json = json.loads(resp_line.splitlines()[0])
+        except Exception:
+            resp_json = None
+
+        if isinstance(resp_json, dict) and resp_json.get("status") in ("control_ready", "connecting"):
+            if resp_json.get("upgrade_control"):
+                c_info, srv_ip = promote_socket_to_control_channel(s, client_ip, resp_json)
+                auth_ack = {
+                    "status": "success",
+                    "server_hostname": LOCAL_HOSTNAME,
+                    "server_os": LOCAL_OS,
+                    "server_ip": srv_ip
+                }
+                s.sendall((json.dumps(auth_ack) + "\n").encode('utf-8'))
+                threading.Thread(target=run_server_control_reader, args=(s, client_ip), daemon=True).start()
+                return "upgraded", f"Connected directly to {c_info.get('hostname', client_ip)}"
+
+        s.close()
+        if "connecting" in resp_line or "success" in resp_line:
             return "ok", "Invitation accepted by client."
     except Exception:
         pass
@@ -1507,7 +1914,6 @@ def invite_waiting_client(client_ip, invite_port=DEFAULT_CLIENT_INVITE_PORT, udp
     if udp_sent:
         return "udp_sent", "UDP invitation sent."
     return "unreachable", f"Could not reach waiting client at {client_ip}:{invite_port}"
-
 
 # ==============================================================================
 # FLASK WEB UI & REST API
@@ -1543,14 +1949,14 @@ def download_client_script():
 def api_waiting_clients():
     if request.args.get('probe', 'false').lower() == 'true':
         send_udp_probe()
-        time.sleep(0.15)
+        time.sleep(0.2)
 
     now = time.time()
     active_list = []
     with waiting_clients_lock:
         expired = [
             k for k, v in waiting_clients.items()
-            if (now - v['last_seen'] > 25.0) and not (
+            if (now - v['last_seen'] > 30.0) and not (
                 connected_client_info and connected_client_info.get("client_id") == v.get("client_id")
             )
         ]
@@ -1578,7 +1984,6 @@ def api_waiting_clients():
         "connected_client": connected_client_info if global_control_socket is not None else None,
         "waiting_clients": active_list
     })
-
 
 @app.route('/api/clients/connect', methods=['POST'])
 def api_connect_client():
@@ -1642,6 +2047,12 @@ def api_connect_client():
     prev_seq = peer_connection_seq
     invite_status, invite_msg = invite_waiting_client(ip, invite_port, udp_port, password_hash=pwd_hash)
 
+    if invite_status == "upgraded" and global_control_socket is not None and connected_client_info:
+        return jsonify({
+            "status": "success",
+            "message": invite_msg,
+            "connected_client": connected_client_info
+        })
     if invite_status == "auth_failed":
         return jsonify({
             "status": "auth_error",
@@ -1651,7 +2062,8 @@ def api_connect_client():
     if invite_status == "unreachable":
         return jsonify({"status": "error", "message": invite_msg})
 
-    for _ in range(35):
+    # Wait up to 7.0 seconds for fallback reverse connection if socket wasn't upgraded directly
+    for _ in range(70):
         if global_control_socket is not None and connected_client_info and peer_connection_seq > prev_seq:
             return jsonify({
                 "status": "success",
@@ -1669,7 +2081,6 @@ def api_connect_client():
             "message": "Client did not establish connection (verify client password or firewall settings)."
         })
     return jsonify({"status": "error", "message": "Invitation sent, but client did not establish control channel in time."})
-
 
 @app.route('/api/clients/disconnect', methods=['POST'])
 def api_disconnect_client():
@@ -2411,32 +2822,7 @@ def handle_client(conn, addr):
                 print(f"[!] Control authentication failed from {addr[0]} (password mismatch).")
                 return
 
-            conn.settimeout(None)
-            routed_srv_ip = conn.getsockname()[0]
-            if routed_srv_ip.startswith('127.') or routed_srv_ip == '0.0.0.0':
-                routed_srv_ip = get_primary_local_ip()
-
-            c_info = {
-                "client_id": client_id or f"{addr[0]}:{payload.get('invite_port', DEFAULT_CLIENT_INVITE_PORT)}",
-                "hostname": payload.get("hostname") or "Remote-Client",
-                "os": (payload.get("os") or "unknown").lower(),
-                "ip": addr[0],
-                "server_ip": routed_srv_ip,
-                "invite_port": payload.get("invite_port", DEFAULT_CLIENT_INVITE_PORT),
-                "requires_password": bool(recv_pwd_hash),
-                "has_zstd": bool(payload.get("has_zstd", False)),
-                "connected_at": time.time()
-            }
-            with control_socket_lock:
-                if global_control_socket:
-                    try:
-                        global_control_socket.close()
-                    except Exception:
-                        pass
-                global_control_socket = conn
-                connected_client_info = c_info
-                peer_connection_seq += 1
-
+            c_info, routed_srv_ip = promote_socket_to_control_channel(conn, addr[0], payload)
             auth_ack = {
                 "status": "success",
                 "server_hostname": LOCAL_HOSTNAME,
@@ -2444,59 +2830,7 @@ def handle_client(conn, addr):
                 "server_ip": routed_srv_ip
             }
             conn.sendall((json.dumps(auth_ack) + "\n").encode('utf-8'))
-            print(f"[*] Client connected: {c_info['hostname']} ({addr[0]}) [OS: {c_info['os'].upper()}]")
-
-            buffer = bytearray()
-            while server_running:
-                try:
-                    data = conn.recv(4096)
-                    if not data:
-                        break
-                    buffer.extend(data)
-                    while b'\n' in buffer:
-                        nl = buffer.find(b'\n')
-                        line_bytes = bytes(buffer[:nl]).strip()
-                        del buffer[:nl + 1]
-                        if line_bytes:
-                            msg = json.loads(line_bytes.decode('utf-8'))
-                            m_act = msg.get("action")
-                            if m_act == "dir_result":
-                                last_dir_result = msg
-                                dir_result_event.set()
-                            elif m_act == "push_manifest_processed":
-                                threading.Thread(
-                                    target=handle_push_manifest_processed,
-                                    args=(msg,),
-                                    daemon=True
-                                ).start()
-                            elif m_act == "transfer_interrupted":
-                                tok = msg.get("session_token") or current_active_token
-                                stop_push_workers()
-                                with db_lock:
-                                    set_meta('transfer_state', 'interrupted')
-                                    if tok:
-                                        sync_session_metrics(tok, override_status='interrupted')
-                                finalize_db_wal()
-                except Exception:
-                    break
-
-            stop_push_workers()
-            with control_socket_lock:
-                if global_control_socket is conn:
-                    global_control_socket = None
-                    connected_client_info = None
-            print(f"[*] Client control channel disconnected ({addr[0]}).")
-            with db_lock:
-                if current_active_token:
-                    cursor = db_conn.execute("""
-                        SELECT COUNT(*) FROM chunks c
-                        INNER JOIN files f ON c.file_id = f.file_id
-                        WHERE f.session_token = ? AND c.status = 'pending'
-                    """, (current_active_token,))
-                    if (cursor.fetchone()[0] or 0) > 0:
-                        set_meta('transfer_state', 'interrupted')
-                        sync_session_metrics(current_active_token, override_status='interrupted')
-            finalize_db_wal()
+            run_server_control_reader(conn, addr[0])
             return
 
         # 2A. Data Worker Stream Channel for PULL (Client -> Server)
