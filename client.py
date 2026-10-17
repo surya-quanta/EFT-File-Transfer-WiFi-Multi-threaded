@@ -14,6 +14,8 @@ import sqlite3
 import atexit
 import shutil
 import getpass
+import subprocess
+import ctypes
 from datetime import datetime
 from pathlib import PurePosixPath
 import zlib
@@ -60,24 +62,58 @@ def hash_password(raw_password):
     return hashlib.sha256(str(raw_password).encode('utf-8')).hexdigest()
 
 
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(0.2)
-        s.connect(('8.8.8.8', 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        pass
+def get_all_client_ips():
+    """
+    Enumerate all local IPv4 addresses across Wi-Fi/LAN interfaces (including Android wlan0/swlan0),
+    filtering out loopback (127.x) and Android 464XLAT cellular translation addresses (192.0.0.x).
+    """
+    ips = set()
+    probe_targets = [
+        '10.255.255.254', '192.168.1.1', '192.168.0.1',
+        '172.16.0.1', '192.168.43.1', '8.8.8.8'
+    ]
+    if active_server_ip and not active_server_ip.startswith('127.'):
+        probe_targets.insert(0, active_server_ip)
+
+    for target in probe_targets:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.1)
+            s.connect((target, 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith('127.'):
+                ips.add(ip)
+        except Exception:
+            pass
+
+    if CLIENT_OS in ('android', 'linux'):
+        try:
+            out = subprocess.check_output(['ip', '-4', '-o', 'addr', 'show'], stderr=subprocess.DEVNULL, text=True, timeout=1.5)
+            for line in out.splitlines():
+                parts = line.split()
+                for i, token in enumerate(parts):
+                    if token == 'inet' and i + 1 < len(parts):
+                        addr = parts[i + 1].split('/')[0]
+                        if not addr.startswith('127.'):
+                            ips.add(addr)
+        except Exception:
+            pass
+
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             ip = info[4][0]
             if not ip.startswith('127.'):
-                return ip
+                ips.add(ip)
     except Exception:
         pass
-    return '127.0.0.1'
+
+    lan_ips = [ip for ip in ips if not ip.startswith('192.0.0.')]
+    return sorted(lan_ips) if lan_ips else (sorted(ips) if ips else ['127.0.0.1'])
+
+
+def get_local_ip():
+    return get_all_client_ips()[0]
 
 
 def get_default_browse_directory():
@@ -326,9 +362,19 @@ def finalize_db_wal():
                     pass
 
 
+def release_android_wakelock():
+    """Release Termux wake-lock on Android when client stops or exits."""
+    if CLIENT_OS == 'android' and shutil.which("termux-wake-unlock"):
+        try:
+            subprocess.run("termux-wake-unlock", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
+        except Exception:
+            pass
+
+
 def close_db_cleanly():
-    """Guaranteed cleanup on client exit so .db-wal and .db-shm are completely removed."""
+    """Guaranteed cleanup on client exit so .db-wal/.db-shm are removed and Android wake-lock is released."""
     global state_conn, history_conn
+    release_android_wakelock()
     with db_lock:
         for c in (state_conn, history_conn):
             if c is not None:
@@ -1202,7 +1248,8 @@ def prepare_push_session_on_client(cmd, c_sock):
         "already_completed": already_completed,
         "pre_existed_map": pre_existed_map,
         "total_chunks": tot_c,
-        "received_chunks": recv_c
+        "received_chunks": recv_c,
+        "has_zstd": HAS_ZSTD
     }
     try:
         c_sock.sendall((json.dumps(reply) + "\n").encode('utf-8'))
@@ -1344,8 +1391,12 @@ def push_network_worker(worker_id, session_token, server_ip, server_port, srv_na
                 "session_completed": all_done
             }
             worker_socket.sendall((json.dumps(ack_payload) + "\n").encode('utf-8'))
-    except Exception:
-        pass
+            if all_done:
+                push_receiving_active = False
+                break
+    except Exception as e:
+        with console_print_lock:
+            print(f"[!] Push worker {worker_id} error: {e}")
     finally:
         with push_worker_sock_lock:
             active_push_worker_sockets.discard(worker_socket)
@@ -1653,10 +1704,10 @@ def get_client_broadcast_targets():
         ('255.255.255.255', DISCOVERY_UDP_PORT),
         ('127.0.0.1', DISCOVERY_UDP_PORT)
     }
-    lip = get_local_ip()
-    parts = lip.split('.')
-    if len(parts) == 4 and not lip.startswith('127.'):
-        targets.add((f"{parts[0]}.{parts[1]}.{parts[2]}.255", DISCOVERY_UDP_PORT))
+    for lip in get_all_client_ips():
+        parts = lip.split('.')
+        if len(parts) == 4 and not lip.startswith('127.'):
+            targets.add((f"{parts[0]}.{parts[1]}.{parts[2]}.255", DISCOVERY_UDP_PORT))
     if active_server_ip:
         targets.add((active_server_ip, DISCOVERY_UDP_PORT))
     for sip in list(known_server_ips):
@@ -1754,7 +1805,8 @@ def run_control_session(server_ip, server_port):
         "client_id": CLIENT_ID,
         "hostname": CLIENT_HOSTNAME,
         "os": CLIENT_OS,
-        "invite_port": bound_invite_port
+        "invite_port": bound_invite_port,
+        "has_zstd": HAS_ZSTD
     }
     try:
         c_sock.sendall((json.dumps(auth_payload) + "\n").encode('utf-8'))
@@ -1978,7 +2030,7 @@ def interactive_history_viewer():
 
         if viewing_session_token is None:
             print(border)
-            print(" ⚡ EFT v3.0 CLIENT — TRANSFER HISTORY VIEWER (client_transfer_history.db)")
+            print(" ⚡ EFT v3.1 CLIENT — TRANSFER HISTORY VIEWER (client_transfer_history.db)")
             print(border)
 
             if not sessions:
@@ -2175,9 +2227,90 @@ def configure_client_password_interactive():
             print("[!] Invalid choice. Enter 1 or 2.")
 
 
+def ensure_os_network_and_av_readiness():
+    """
+    Cross-platform network & antivirus readiness helper for EFT Client:
+    - Windows: Switches Public Wi-Fi to Private, removes Block rules on python.exe, and opens ports 8083-8098.
+    - Linux: Opens ports 8083-8098 if UFW is active.
+    - Android: Acquires termux-wake-lock so Doze Mode never drops transfers.
+    """
+    if CLIENT_OS == 'windows':
+        rule_name = "EFT_Client_v3_Inbound_Ready"
+        py_exe = os.path.abspath(sys.executable)
+        invite_port_range = f"{DEFAULT_INVITE_PORT}-{DEFAULT_INVITE_PORT + 15}"
+        save_dir_clean = os.path.abspath(CLIENT_SAVE_DIRECTORY)
+
+        needs_config = True
+        try:
+            chk_ps = (
+                f'$r = Get-NetFirewallRule -DisplayName "{rule_name}" -ErrorAction SilentlyContinue; '
+                f'$pub = Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object {{ $_.NetworkCategory -eq "Public" }}; '
+                f'$blk = Get-NetFirewallApplicationFilter -Program "{py_exe}" -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Action -eq "Block" }}; '
+                f'if ($r -and (-not $pub) -and (-not $blk)) {{ Write-Output "READY" }}'
+            )
+            chk = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", chk_ps],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4.0
+            )
+            if "READY" in (chk.stdout or ""):
+                needs_config = False
+        except Exception:
+            pass
+
+        if needs_config:
+            print("[*] Windows Network Security: Switching Public profile to Private & clearing Python firewall blocks...")
+            ps_script = (
+                "Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object { $_.NetworkCategory -eq 'Public' } | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue; "
+                "Get-NetFirewallRule -Action Block -Enabled True -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'python' } | Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
+                f"Get-NetFirewallApplicationFilter -Program '{py_exe}' -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Action -eq 'Block' }} | Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
+                f"netsh advfirewall firewall delete rule name=\"{rule_name}\" >$null 2>&1; "
+                f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow protocol=TCP localport={invite_port_range} profile=any enable=yes >$null 2>&1; "
+                f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow protocol=UDP localport={CLIENT_PROBE_UDP_PORT} profile=any enable=yes >$null 2>&1; "
+                f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow program=\"{py_exe}\" profile=any enable=yes >$null 2>&1; "
+                f"Add-MpPreference -ExclusionPath '{save_dir_clean}' -ErrorAction SilentlyContinue"
+            )
+
+            try:
+                is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                is_admin = False
+
+            if is_admin:
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print("[*] Windows Network Security: Client Wi-Fi set to Private and firewall rules applied.")
+            else:
+                print("[*] Windows Security: Please click 'Yes' on the UAC prompt to switch Wi-Fi to Private and unblock ports...")
+                try:
+                    ret = ctypes.windll.shell32.ShellExecuteW(
+                        None, "runas", "powershell.exe", f'-NoProfile -ExecutionPolicy Bypass -Command "{ps_script}"', None, 1
+                    )
+                    if int(ret) > 32:
+                        time.sleep(2.2)
+                        print("[*] Windows Network Security: Client Wi-Fi profile switched to Private and rules applied.")
+                except Exception:
+                    pass
+
+    elif CLIENT_OS == 'linux':
+        try:
+            if shutil.which("ufw"):
+                ufw_st = subprocess.run("ufw status", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if "Status: active" in (ufw_st.stdout or "") and str(DEFAULT_INVITE_PORT) not in (ufw_st.stdout or ""):
+                    subprocess.run(f"sudo ufw allow {DEFAULT_INVITE_PORT}:8098/tcp && sudo ufw allow {CLIENT_PROBE_UDP_PORT}/udp", shell=True)
+        except Exception:
+            pass
+
+    elif CLIENT_OS == 'android':
+        if shutil.which("termux-wake-lock"):
+            try:
+                subprocess.run("termux-wake-lock", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
+
 def main_client_loop():
     global client_running, active_server_ip, active_server_port
     client_running = True
+    ensure_os_network_and_av_readiness()
     threading.Thread(target=tcp_invite_listener_loop, daemon=True).start()
     time.sleep(0.1)
     threading.Thread(target=udp_beacon_and_probe_loop, daemon=True).start()
@@ -2195,7 +2328,7 @@ def main_client_loop():
 
     auth_badge = "LOCKED (Password Required)" if REQUIRES_PASSWORD else "OPEN (No Password)"
     print("\n" + "=" * 76)
-    print(f"[*] EFT Two-Way Client v3.0 online ({CLIENT_OS.upper()} | {CLIENT_HOSTNAME})")
+    print(f"[*] EFT Two-Way Client v3.1 online ({CLIENT_OS.upper()} | {CLIENT_HOSTNAME})")
     print(f"[*] Local IP    : {get_local_ip()} | Invite Port: {bound_invite_port}")
     print(f"[*] Auth Mode   : {auth_badge}")
     print(f"[*] State DB    : {CLIENT_STATE_DB_PATH}")
@@ -2220,14 +2353,14 @@ def main_client_loop():
 
 
 def run_startup_menu():
-    """Interactive numerical startup menu for EFT Client v3.0."""
+    """Interactive numerical startup menu for EFT Client v3.1."""
     if "--no-menu" in sys.argv:
         main_client_loop()
         return
 
     while True:
         print("\n" + "=" * 68)
-        print(f" ⚡ EFFICIENT FILE TRANSFER (EFT) v3.0 — CLIENT ({CLIENT_HOSTNAME} | {CLIENT_OS.upper()})")
+        print(f" ⚡ EFFICIENT FILE TRANSFER (EFT) v3.1 — CLIENT ({CLIENT_HOSTNAME} | {CLIENT_OS.upper()})")
         print("=" * 68)
         print("  1. Start EFT Client (Configure Password / No Password & Wait for Server)")
         print("  2. Read Old Transfer History (Arrow-Key Viewer)")
