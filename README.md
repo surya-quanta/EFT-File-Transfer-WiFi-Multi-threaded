@@ -228,7 +228,7 @@ In the Server Web UI (`http://127.0.0.1:8081`), the **Client Discovery & Authent
 **Watch Live Progress:** Both the Web UI progress bar and the Server/Client terminals will display real-time directional transfer logs:
 ```text
 [2026-10-17 16:14:22] ⬅ Pulled DCIM/Camera/VID_01.mp4 (124.50 MB) [12/45 files | 64.2%] -> Server QuantaPixel-SDS (10.110.233.3)
-[2026-10-17 16:18:05] ➡ Pushed Movies/About_Time_1080p.mkv (757.70 MB) [1/1 files | 100.0%] -> Client linux27 (10.110.233.53)
+[2026-10-17 16:18:05] ➡ Pushed Movies/movie_1080p.mkv (757.70 MB) [1/1 files | 100.0%] -> Client linux27 (10.110.233.53)
 ```
 
 ---
