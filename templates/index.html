@@ -1049,9 +1049,20 @@
             </div>
 
             <div class="session-files-panel">
-                <div class="panel-title">
+                <div class="panel-title" style="flex-wrap:wrap; gap:10px;">
                     <span id="sd-files-panel-heading">Transferred Files Log (Source Path & Saved Destination Path)</span>
-                    <span id="sd-file-log-summary" style="color:var(--text-secondary); font-weight:normal;">0 items</span>
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        <input type="text" id="sd-files-search"
+                            placeholder="🔍 Search session files..."
+                            oninput="onSessionFilesSearch(this.value)"
+                            style="background:var(--input-bg); border:1px solid var(--border-color); color:var(--text-main); padding:4px 8px; border-radius:5px; font-size:11.5px; width:175px; outline:none;">
+                        <span id="sd-file-log-summary" style="color:var(--text-secondary); font-weight:normal;">0 items</span>
+                        <div style="display:inline-flex; align-items:center; gap:4px;">
+                            <button id="sd-page-prev" onclick="changeSessionFilesPage(-1)" style="padding:3px 8px; font-size:11px;">« Prev</button>
+                            <span id="sd-page-info" style="font-size:11px; color:var(--text-secondary); font-family:Consolas,monospace; padding:0 4px;">Page 1/1</span>
+                            <button id="sd-page-next" onclick="changeSessionFilesPage(1)" style="padding:3px 8px; font-size:11px;">Next »</button>
+                        </div>
+                    </div>
                 </div>
                 <div class="files-table-header">
                     <span>File Name & Relative Path (Source ➔ Destination)</span>
@@ -1345,8 +1356,32 @@
             updateSmartToolbar();
         }
 
+        let sessionFilesPage = 1;
+        let sessionFilesPerPage = 100;
+        let sessionFilesTotalPages = 1;
+        let sessionFilesSearchQuery = '';
+
+        function changeSessionFilesPage(delta) {
+            const next = sessionFilesPage + delta;
+            if (next < 1 || next > sessionFilesTotalPages) return;
+            sessionFilesPage = next;
+            refreshSelectedSessionDetail();
+        }
+
+        function onSessionFilesSearch(val) {
+            sessionFilesSearchQuery = (val || '').trim();
+            sessionFilesPage = 1;
+            refreshSelectedSessionDetail();
+        }
+
         async function openSessionDetail(sessionToken) {
             currentViewMode = 'session_detail';
+            if (selectedSessionToken !== sessionToken) {
+                sessionFilesPage = 1;
+                sessionFilesSearchQuery = '';
+                const sInput = document.getElementById('sd-files-search');
+                if (sInput) sInput.value = '';
+            }
             selectedSessionToken = sessionToken;
             document.getElementById('new-transfer-view').style.display = 'none';
             document.getElementById('session-detail-view').style.display = 'flex';
@@ -1359,7 +1394,12 @@
         async function refreshSelectedSessionDetail() {
             if (!selectedSessionToken) return;
             try {
-                const res = await fetch(`/api/sessions/${encodeURIComponent(selectedSessionToken)}`);
+                const params = new URLSearchParams({
+                    page: sessionFilesPage,
+                    per_page: sessionFilesPerPage,
+                    search: sessionFilesSearchQuery
+                });
+                const res = await fetch(`/api/sessions/${encodeURIComponent(selectedSessionToken)}?${params.toString()}`);
                 const data = await res.json();
                 if (data.status !== 'success' || !data.session) return;
 
@@ -1406,10 +1446,21 @@
 
                 const tbody = document.getElementById('sd-files-tbody');
                 const files = s.files || [];
-                document.getElementById('sd-file-log-summary').innerText = `${files.length} item(s) logged`;
+                const totalRows = s.total_file_rows !== undefined ? s.total_file_rows : files.length;
+                sessionFilesTotalPages = s.total_pages || 1;
+                sessionFilesPage = s.page || 1;
+
+                const startItem = totalRows === 0 ? 0 : ((sessionFilesPage - 1) * sessionFilesPerPage) + 1;
+                const endItem = Math.min(totalRows, sessionFilesPage * sessionFilesPerPage);
+                document.getElementById('sd-file-log-summary').innerText =
+                    `Showing ${startItem}–${endItem} of ${totalRows} item(s)`;
+                document.getElementById('sd-page-info').innerText =
+                    `Page ${sessionFilesPage} / ${sessionFilesTotalPages}`;
+                document.getElementById('sd-page-prev').disabled = (sessionFilesPage <= 1);
+                document.getElementById('sd-page-next').disabled = (sessionFilesPage >= sessionFilesTotalPages);
 
                 if (files.length === 0) {
-                    tbody.innerHTML = '<div class="empty-state-box">No files recorded for this session yet.</div>';
+                    tbody.innerHTML = '<div class="empty-state-box">No matching files recorded for this session.</div>';
                 } else {
                     tbody.innerHTML = files.map(f => {
                         const isDirEntry = (f.relative_path || '').endsWith('/');
@@ -1449,7 +1500,7 @@
                 }
             } catch (e) {}
         }
-
+        
         async function triggerSessionAction(actionType, explicitToken = null) {
             const targetToken = explicitToken || selectedSessionToken;
             if (!targetToken) return;
