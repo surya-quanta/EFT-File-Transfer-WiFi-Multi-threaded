@@ -167,6 +167,8 @@ def connect_socket_to_server(server_ip, server_port, timeout=30.0, connect_timeo
     sock.settimeout(connect_timeout)
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
     except Exception:
         pass
 
@@ -868,6 +870,20 @@ def list_directory(target_path):
         return {"status": "error", "message": str(e), "os": CLIENT_OS, "current_path": target_path}
 
 
+import stat as stat_module
+
+
+def is_regular_readable_file(path):
+    """Fast metadata-only check: returns True ONLY for real non-symlink regular files (skips sockets, FIFOs, symlinks)."""
+    try:
+        st = os.lstat(path)
+        if not stat_module.S_ISREG(st.st_mode):
+            return False
+        return os.access(path, os.R_OK)
+    except (PermissionError, OSError):
+        return False
+
+
 def build_manifest(target_paths):
     manifest = {"files": [], "dirs": [], "total_bytes": 0}
     local_mapping = {}
@@ -880,6 +896,8 @@ def build_manifest(target_paths):
         parent_dir = os.path.dirname(target_path.rstrip('/\\'))
 
         if os.path.isfile(target_path):
+            if not is_regular_readable_file(target_path):
+                continue
             try:
                 stat = os.stat(target_path)
                 rel_path = normalize_rel_path(os.path.basename(target_path))
@@ -896,23 +914,14 @@ def build_manifest(target_paths):
                 continue
 
         elif os.path.isdir(target_path):
-            for root, dirs, files in os.walk(target_path):
-                if not files and not dirs:
-                    try:
-                        stat = os.stat(root)
-                        rel_dir = normalize_rel_path(os.path.relpath(root, parent_dir))
-                        if rel_dir:
-                            manifest["dirs"].append({
-                                "relative_path": rel_dir,
-                                "source_path": root,
-                                "mtime": stat.st_mtime,
-                                "atime": stat.st_atime
-                            })
-                    except (PermissionError, OSError):
-                        pass
+            for root, dirs, files in os.walk(target_path, followlinks=False):
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+                valid_files_in_dir = 0
 
                 for file in files:
                     full_path = os.path.join(root, file)
+                    if not is_regular_readable_file(full_path):
+                        continue
                     try:
                         stat = os.stat(full_path)
                         rel_raw = os.path.relpath(full_path, parent_dir)
@@ -926,8 +935,23 @@ def build_manifest(target_paths):
                         })
                         manifest["total_bytes"] += stat.st_size
                         local_mapping[rel_path] = full_path
+                        valid_files_in_dir += 1
                     except (PermissionError, OSError):
                         continue
+
+                if valid_files_in_dir == 0 and not dirs:
+                    try:
+                        stat = os.stat(root)
+                        rel_dir = normalize_rel_path(os.path.relpath(root, parent_dir))
+                        if rel_dir:
+                            manifest["dirs"].append({
+                                "relative_path": rel_dir,
+                                "source_path": root,
+                                "mtime": stat.st_mtime,
+                                "atime": stat.st_atime
+                            })
+                    except (PermissionError, OSError):
+                        pass
 
     return manifest, local_mapping
 
@@ -988,8 +1012,6 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
         file_id = missing_map[rel_path]["file_id"]
         missing_indices = sorted(missing_map[rel_path]["missing"])
         full_path = local_mapping.get(rel_path)
-        if not full_path or not os.path.exists(full_path):
-            continue
 
         try:
             with open(full_path, 'rb') as f:
@@ -997,9 +1019,7 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
                     if not transfer_active:
                         break
                     f.seek(chunk_index * CHUNK_SIZE)
-                    raw_bytes = f.read(CHUNK_SIZE)
-                    if not raw_bytes and file_info["size"] > 0:
-                        break
+                    raw_bytes = f.read(CHUNK_SIZE) or b""
                     compressed = cctx.compress(raw_bytes) if can_use_zstd else zlib.compress(raw_bytes, level=1)
                     while transfer_active:
                         try:
@@ -1015,13 +1035,23 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
                         except queue.Full:
                             continue
         except (PermissionError, OSError):
-            continue
-
-    for _ in range(12):
-        try:
-            chunk_queue.put(None, timeout=1.0)
-        except Exception:
-            pass
+            empty_comp = cctx.compress(b"") if can_use_zstd else zlib.compress(b"", level=1)
+            for chunk_index in missing_indices:
+                if not transfer_active:
+                    break
+                while transfer_active:
+                    try:
+                        chunk_queue.put({
+                            "file_id": file_id,
+                            "relative_path": rel_path,
+                            "file_size": file_info["size"],
+                            "chunk_index": chunk_index,
+                            "comp": comp_label,
+                            "data": empty_comp
+                        }, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
 
 
 def stream_pull_chunks_on_socket(worker_socket, chunk_queue, session_token, server_ip, srv_name):
@@ -1046,12 +1076,22 @@ def stream_pull_chunks_on_socket(worker_socket, chunk_queue, session_token, serv
         chunk_data = chunk["data"]
 
         header = struct.pack('!II', len(meta_bytes), len(chunk_data))
-        worker_socket.sendall(header + meta_bytes + chunk_data)
+        try:
+            worker_socket.sendall(header + meta_bytes + chunk_data)
+            ack_msg = recv_json_line(worker_socket)
+        except Exception:
+            ack_msg = None
 
-        ack_msg = recv_json_line(worker_socket)
-        chunk_queue.task_done()
-        if not ack_msg:
+        if not ack_msg or not isinstance(ack_msg, dict):
+            # Put the unacknowledged chunk back into chunk_queue so another live worker sends it!
+            if transfer_active and chunk_queue is not None:
+                try:
+                    chunk_queue.put_nowait(chunk)
+                except Exception:
+                    pass
+            chunk_queue.task_done()
             break
+        chunk_queue.task_done()
 
         if isinstance(ack_msg, dict):
             rel_p = ack_msg.get("relative_path") or chunk.get("relative_path", "")
@@ -1104,6 +1144,11 @@ def stream_pull_chunks_on_socket(worker_socket, chunk_queue, session_token, serv
                 )
             if sess_done:
                 transfer_active = False
+                for _ in range(8):
+                    try:
+                        chunk_queue.put_nowait(None)
+                    except Exception:
+                        break
                 break
 
 
@@ -1171,6 +1216,8 @@ def prepare_push_session_on_client(cmd, c_sock):
     c_ip = get_local_ip()
 
     with db_lock:
+        state_conn.execute("BEGIN IMMEDIATE")
+        history_conn.execute("BEGIN IMMEDIATE")
         existing_sess = history_conn.execute(
             "SELECT started_at FROM transfer_sessions WHERE session_token=?", (token,)
         ).fetchone()
@@ -1324,6 +1371,8 @@ def prepare_push_session_on_client(cmd, c_sock):
             total_chunks=tot_c,
             override_status='completed' if is_all_done else 'active'
         )
+        state_conn.execute("COMMIT")
+        history_conn.execute("COMMIT")
         if is_all_done:
             finalize_db_wal()
 
@@ -1355,7 +1404,7 @@ def prepare_push_session_on_client(cmd, c_sock):
 
 
 def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_name):
-    """Receive compressed PUSH chunks over an already-authenticated worker_socket (inbound or outbound)."""
+    """Receive compressed PUSH chunks over an already-authenticated worker_socket with O(1) SQLite updates."""
     global push_receiving_active
     dctx = zstd.ZstdDecompressor() if HAS_ZSTD else None
     while push_receiving_active and client_running:
@@ -1387,12 +1436,14 @@ def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_n
 
         with db_lock:
             row = state_conn.execute(
-                "SELECT session_token, relative_path, save_path, size FROM files WHERE file_id=?",
+                "SELECT session_token, relative_path, save_path, size, atime, mtime FROM files WHERE file_id=?",
                 (file_id,)
             ).fetchone()
             if not row:
                 break
-            f_token, rel_path, final_path, file_size = row[0], row[1], row[2], row[3] or 0
+            f_token, rel_path, final_path, file_size, atime, mtime = (
+                row[0], row[1], row[2], row[3] or 0, row[4], row[5]
+            )
 
         flock = get_file_lock(file_id)
         with flock:
@@ -1405,42 +1456,59 @@ def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_n
         now_ts = time.time()
         all_done = False
         with db_lock:
-            state_conn.execute(
-                "UPDATE chunks SET status='received' WHERE file_id=? AND chunk_index=?",
+            upd = state_conn.execute(
+                "UPDATE chunks SET status='received' WHERE file_id=? AND chunk_index=? AND status!='received'",
                 (file_id, chunk_index)
             )
+            chunk_newly_received = 1 if upd.rowcount > 0 else 0
+
             pending_count = state_conn.execute(
                 "SELECT COUNT(*) FROM chunks WHERE file_id=? AND status='pending'",
                 (file_id,)
             ).fetchone()[0]
 
+            file_newly_completed = 0
             if pending_count == 0:
-                atime, mtime = state_conn.execute(
-                    "SELECT atime, mtime FROM files WHERE file_id=?", (file_id,)
-                ).fetchone()
-                history_conn.execute("""
+                h_upd = history_conn.execute("""
                     UPDATE transfer_history_files
                     SET status = 'completed', transferred_at = ?
-                    WHERE session_token = ? AND relative_path = ?
+                    WHERE session_token = ? AND relative_path = ? AND status != 'completed'
                 """, (now_ts, f_token, rel_path))
+                file_newly_completed = 1 if h_upd.rowcount > 0 else 0
 
-            c_totals = state_conn.execute("""
-                SELECT COUNT(*), SUM(CASE WHEN c.status='received' THEN 1 ELSE 0 END)
-                FROM chunks c
-                INNER JOIN files f ON c.file_id = f.file_id
-                WHERE f.session_token = ?
+            # O(1) atomic counter increment on transfer_sessions (zero table scans per chunk!)
+            history_conn.execute("""
+                UPDATE transfer_sessions
+                SET updated_at = ?,
+                    received_chunks = received_chunks + ?,
+                    completed_files = completed_files + ?,
+                    transferred_bytes = transferred_bytes + ?
+                WHERE session_token = ?
+            """, (
+                now_ts,
+                chunk_newly_received,
+                file_newly_completed,
+                file_size if file_newly_completed else 0,
+                f_token
+            ))
+
+            sc_row = history_conn.execute("""
+                SELECT completed_files, total_files, received_chunks, total_chunks
+                FROM transfer_sessions WHERE session_token = ?
             """, (f_token,)).fetchone()
-            tot_c = c_totals[0] or 0
-            recv_c = c_totals[1] or 0
+            comp_f = sc_row[0] if sc_row else 0
+            tot_f = sc_row[1] if sc_row else 0
+            recv_c = sc_row[2] if sc_row else 0
+            tot_c = sc_row[3] if sc_row else 0
+
             if tot_c > 0 and recv_c >= tot_c:
                 all_done = True
-
-            comp_f, tot_f, _, _ = sync_client_session_progress(
-                f_token,
-                received_chunks=recv_c,
-                total_chunks=tot_c,
-                override_status='completed' if all_done else 'active'
-            )
+                comp_f, tot_f, recv_c, tot_c = sync_client_session_progress(
+                    f_token,
+                    received_chunks=recv_c,
+                    total_chunks=tot_c,
+                    override_status='completed'
+                )
 
         if pending_count == 0:
             try:
@@ -1475,7 +1543,6 @@ def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_n
         if all_done:
             push_receiving_active = False
             break
-
 
 def push_network_worker(worker_id, session_token, server_ip, server_port, srv_name):
     global push_receiving_active
