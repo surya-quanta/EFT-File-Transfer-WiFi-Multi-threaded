@@ -7,6 +7,7 @@ import math
 import queue
 import struct
 import threading
+import hmac
 import time
 import platform
 import secrets
@@ -54,12 +55,23 @@ CLIENT_HISTORY_DB_PATH = os.path.join(BASE_DIR, 'client_transfer_history.db')
 # Client-controlled security state (configured at startup menu; never hardcoded)
 CLIENT_PASSWORD_HASH = ""
 REQUIRES_PASSWORD = False
+CLIENT_AUTH_NONCE = secrets.token_hex(16)
 
 
 def hash_password(raw_password):
     if not raw_password:
         return ""
     return hashlib.sha256(str(raw_password).encode('utf-8')).hexdigest()
+
+
+def compute_auth_hmac(password_hash, nonce):
+    if not password_hash or not nonce:
+        return ""
+    return hmac.new(
+        str(password_hash).encode('utf-8'),
+        str(nonce).encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
 
 
 def get_all_client_ips():
@@ -229,6 +241,7 @@ active_push_worker_sockets = set()
 push_worker_sock_lock = threading.Lock()
 
 file_locks = {}
+open_file_handles = {}
 file_lock_mutex = threading.Lock()
 
 
@@ -239,7 +252,40 @@ def get_file_lock(file_id):
         return file_locks[file_id]
 
 
+def get_cached_file_handle(file_id, final_path, file_size):
+    """Return a cached r+b file handle for file_id (creating/truncating lazily on first chunk write). Caller must hold get_file_lock(file_id)."""
+    fh = open_file_handles.get(file_id)
+    if fh is not None and not fh.closed:
+        return fh
+    if not os.path.exists(final_path):
+        os.makedirs(os.path.dirname(final_path), exist_ok=True)
+        with open(final_path, 'wb') as f_init:
+            if file_size > 0:
+                f_init.truncate(file_size)
+    fh = open(final_path, 'r+b')
+    open_file_handles[file_id] = fh
+    return fh
+
+
+def close_cached_file_handle(file_id):
+    fh = open_file_handles.pop(file_id, None)
+    if fh is not None:
+        try:
+            fh.flush()
+            fh.close()
+        except Exception:
+            pass
+
+
+def close_all_cached_file_handles():
+    with file_lock_mutex:
+        fids = list(open_file_handles.keys())
+    for fid in fids:
+        close_cached_file_handle(fid)
+
+
 def release_file_lock(file_id):
+    close_cached_file_handle(file_id)
     with file_lock_mutex:
         file_locks.pop(file_id, None)
 
@@ -446,8 +492,13 @@ def release_android_wakelock():
 
 
 def close_db_cleanly():
-    """Guaranteed cleanup on client exit so .db-wal/.db-shm are removed and Android wake-lock is released."""
+    """Guaranteed cleanup on client exit so .db-wal/.db-shm are removed and OS firewall/wake-lock state is reverted."""
     global state_conn, history_conn
+    try:
+        if 'revert_os_network_and_av_changes' in globals():
+            revert_os_network_and_av_changes()
+    except Exception:
+        pass
     release_android_wakelock()
     with db_lock:
         for c in (state_conn, history_conn):
@@ -996,9 +1047,9 @@ def recv_json_line(sock, max_bytes=50 * 1024 * 1024):
 # 1. PULL ENGINE (Client -> Server): Producer-Consumer Chunk Pipeline
 # ==============================================================================
 def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_map, use_zstd=True):
+    """Producer reads raw 5 MB chunks sequentially; the 4 worker threads compress in parallel across 4 CPU cores."""
     global transfer_active
     can_use_zstd = bool(HAS_ZSTD and use_zstd)
-    cctx = zstd.ZstdCompressor(level=3) if can_use_zstd else None
     comp_label = "zstd" if can_use_zstd else "zlib"
 
     for file_info in manifest["files"]:
@@ -1020,7 +1071,6 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
                         break
                     f.seek(chunk_index * CHUNK_SIZE)
                     raw_bytes = f.read(CHUNK_SIZE) or b""
-                    compressed = cctx.compress(raw_bytes) if can_use_zstd else zlib.compress(raw_bytes, level=1)
                     while transfer_active:
                         try:
                             chunk_queue.put({
@@ -1029,13 +1079,12 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
                                 "file_size": file_info["size"],
                                 "chunk_index": chunk_index,
                                 "comp": comp_label,
-                                "data": compressed
+                                "raw_data": raw_bytes
                             }, timeout=0.5)
                             break
                         except queue.Full:
                             continue
         except (PermissionError, OSError):
-            empty_comp = cctx.compress(b"") if can_use_zstd else zlib.compress(b"", level=1)
             for chunk_index in missing_indices:
                 if not transfer_active:
                     break
@@ -1047,7 +1096,7 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
                             "file_size": file_info["size"],
                             "chunk_index": chunk_index,
                             "comp": comp_label,
-                            "data": empty_comp
+                            "raw_data": b""
                         }, timeout=0.5)
                         break
                     except queue.Full:
@@ -1055,8 +1104,9 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
 
 
 def stream_pull_chunks_on_socket(worker_socket, chunk_queue, session_token, server_ip, srv_name):
-    """Stream compressed PULL chunks over an already-authenticated worker_socket (inbound or outbound)."""
+    """Stream compressed PULL chunks over an already-authenticated worker_socket with parallel per-worker compression."""
     global transfer_active
+    cctx = zstd.ZstdCompressor(level=3) if HAS_ZSTD else None
     while transfer_active and chunk_queue is not None:
         try:
             chunk = chunk_queue.get(timeout=0.5)
@@ -1067,10 +1117,19 @@ def stream_pull_chunks_on_socket(worker_socket, chunk_queue, session_token, serv
             chunk_queue.task_done()
             break
 
+        comp_mode = chunk.get("comp", "zstd" if HAS_ZSTD else "zlib")
+        if "data" in chunk:
+            chunk_data = chunk["data"]
+        else:
+            raw_bytes = chunk.get("raw_data", b"")
+            chunk_data = cctx.compress(raw_bytes) if (comp_mode == "zstd" and cctx is not None) else zlib.compress(raw_bytes, level=1)
+            chunk["data"] = chunk_data
+            chunk.pop("raw_data", None)
+
         meta = {
             "file_id": chunk["file_id"],
             "chunk_index": chunk["chunk_index"],
-            "comp": chunk.get("comp", "zstd" if HAS_ZSTD else "zlib")
+            "comp": comp_mode
         }
         meta_bytes = json.dumps(meta).encode('utf-8')
         chunk_data = chunk["data"]
@@ -1179,9 +1238,9 @@ def network_worker(worker_id, chunk_queue, session_token, server_ip, server_port
 def prepare_push_session_on_client(cmd, c_sock):
     """
     Handle incoming start_push_transfer from Server:
-    1. Pre-allocate destination files on Client disk using f.truncate(size).
-    2. Create and timestamp empty folders.
-    3. Record session & file entries in client_transfer_state.db and client_transfer_history.db.
+    1. Verify sufficient free disk space via shutil.disk_usage().
+    2. Detect modified source files on Resume (size or mtime mismatch) and invalidate stale chunks.
+    3. Create empty folders & 0-byte files upfront; non-empty files are allocated lazily on first chunk write.
     4. Reply with push_manifest_processed so the Server can start its chunk producer.
     """
     global master_session_token
@@ -1214,6 +1273,7 @@ def prepare_push_session_on_client(cmd, c_sock):
     pre_existed_map = {}
     now_ts = time.time()
     c_ip = get_local_ip()
+    required_missing_bytes = 0
 
     with db_lock:
         state_conn.execute("BEGIN IMMEDIATE")
@@ -1270,18 +1330,31 @@ def prepare_push_session_on_client(cmd, c_sock):
                 dir_pre, now_ts
             ))
 
-        # 2. Pre-allocate files and populate client_transfer_state.db
+        # 2. Populate client_transfer_state.db and detect modified source files on Resume
         for finfo in files:
             norm_rel = normalize_rel_path(finfo["relative_path"])
             src_full_path = finfo.get("source_path") or norm_rel
             final_path = resolve_local_save_path(dest_dir, norm_rel)
-            os.makedirs(os.path.dirname(final_path), exist_ok=True)
 
             cur = state_conn.execute(
-                "SELECT file_id, save_path, pre_existed FROM files WHERE session_token=? AND relative_path=? AND size=?",
-                (token, norm_rel, finfo["size"])
+                "SELECT file_id, save_path, pre_existed, size, mtime FROM files WHERE session_token=? AND relative_path=?",
+                (token, norm_rel)
             )
             existing = cur.fetchone()
+            if existing:
+                old_fid, old_save_p, old_pre, old_size, old_mtime = existing
+                # Remark #2: If source file size or mtime changed since Pause/Interrupt, invalidate old chunks!
+                if old_size != finfo["size"] or abs((old_mtime or 0.0) - (finfo["mtime"] or 0.0)) > 1e-3:
+                    close_cached_file_handle(old_fid)
+                    state_conn.execute("DELETE FROM chunks WHERE file_id=?", (old_fid,))
+                    state_conn.execute("DELETE FROM files WHERE file_id=?", (old_fid,))
+                    if old_save_p and os.path.exists(old_save_p) and not old_pre:
+                        try:
+                            os.remove(old_save_p)
+                        except Exception:
+                            pass
+                    existing = None
+
             if existing:
                 file_id = existing[0]
                 if existing[1]:
@@ -1310,15 +1383,15 @@ def prepare_push_session_on_client(cmd, c_sock):
 
             pre_existed_map[norm_rel] = pre_existed
 
-            if not os.path.exists(final_path):
-                with open(final_path, 'wb') as f:
-                    if finfo["size"] > 0:
-                        f.truncate(finfo["size"])
-                if finfo["size"] == 0:
-                    try:
-                        os.utime(final_path, (finfo["atime"], finfo["mtime"]))
-                    except Exception:
+            # Remark #1: Only create 0-byte files upfront; non-empty files are created lazily on first chunk write!
+            if finfo["size"] == 0 and not os.path.exists(final_path):
+                try:
+                    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+                    with open(final_path, 'wb') as _:
                         pass
+                    os.utime(final_path, (finfo["atime"], finfo["mtime"]))
+                except Exception:
+                    pass
 
             cur = state_conn.execute(
                 "SELECT chunk_index FROM chunks WHERE file_id=? AND status='pending'",
@@ -1352,8 +1425,38 @@ def prepare_push_session_on_client(cmd, c_sock):
                     "save_path": final_path,
                     "pre_existed": pre_existed
                 }
+                if not os.path.exists(final_path):
+                    required_missing_bytes += finfo["size"]
             else:
                 already_completed.append(norm_rel)
+
+        # Remark #3: Pre-Flight Disk Space Check (ENOSPC) before streaming chunks
+        try:
+            free_disk_bytes = shutil.disk_usage(dest_dir).free
+        except Exception:
+            free_disk_bytes = None
+
+        if free_disk_bytes is not None and required_missing_bytes > free_disk_bytes:
+            state_conn.execute("ROLLBACK")
+            history_conn.execute("ROLLBACK")
+            finalize_db_wal()
+            err_msg = (
+                f"Insufficient disk space on client ({dest_dir}): "
+                f"Need {format_bytes_human(required_missing_bytes)}, have {format_bytes_human(free_disk_bytes)} free."
+            )
+            with console_print_lock:
+                print(f"[!] PUSH Rejected: {err_msg}")
+            try:
+                with control_send_lock:
+                    c_sock.sendall((json.dumps({
+                        "action": "push_manifest_processed",
+                        "status": "disk_full",
+                        "session_token": token,
+                        "message": err_msg
+                    }) + "\n").encode('utf-8'))
+            except Exception:
+                pass
+            return
 
         c_row = state_conn.execute("""
             SELECT COUNT(*), SUM(CASE WHEN c.status='received' THEN 1 ELSE 0 END)
@@ -1387,6 +1490,7 @@ def prepare_push_session_on_client(cmd, c_sock):
 
     reply = {
         "action": "push_manifest_processed",
+        "status": "ok",
         "session_token": token,
         "destination_path": dest_dir,
         "missing_map": missing_map,
@@ -1398,13 +1502,13 @@ def prepare_push_session_on_client(cmd, c_sock):
     }
     try:
         with control_send_lock:
-           c_sock.sendall((json.dumps(reply) + "\n").encode('utf-8'))
+            c_sock.sendall((json.dumps(reply) + "\n").encode('utf-8'))
     except Exception:
         pass
 
 
 def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_name):
-    """Receive compressed PUSH chunks over an already-authenticated worker_socket with O(1) SQLite updates."""
+    """Receive compressed PUSH chunks over an already-authenticated worker_socket with handle caching & O(1) SQLite updates."""
     global push_receiving_active
     dctx = zstd.ZstdDecompressor() if HAS_ZSTD else None
     while push_receiving_active and client_running:
@@ -1445,13 +1549,16 @@ def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_n
                 row[0], row[1], row[2], row[3] or 0, row[4], row[5]
             )
 
+        # Remark #1 & #4: Lazily pre-allocate on first chunk write & reuse cached r+b file handle
         flock = get_file_lock(file_id)
         with flock:
-            if not os.path.exists(final_path):
+            try:
+                fh = get_cached_file_handle(file_id, final_path, file_size)
+                fh.seek(chunk_index * CHUNK_SIZE)
+                fh.write(raw_data)
+            except Exception:
+                close_cached_file_handle(file_id)
                 break
-            with open(final_path, 'r+b') as f:
-                f.seek(chunk_index * CHUNK_SIZE)
-                f.write(raw_data)
 
         now_ts = time.time()
         all_done = False
@@ -1476,7 +1583,6 @@ def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_n
                 """, (now_ts, f_token, rel_path))
                 file_newly_completed = 1 if h_upd.rowcount > 0 else 0
 
-            # O(1) atomic counter increment on transfer_sessions (zero table scans per chunk!)
             history_conn.execute("""
                 UPDATE transfer_sessions
                 SET updated_at = ?,
@@ -1511,10 +1617,12 @@ def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_n
                 )
 
         if pending_count == 0:
-            try:
-                os.utime(final_path, (atime, mtime))
-            except Exception:
-                pass
+            with flock:
+                close_cached_file_handle(file_id)
+                try:
+                    os.utime(final_path, (atime, mtime))
+                except Exception:
+                    pass
             release_file_lock(file_id)
             if tot_f <= 100 or file_size >= 1024 * 1024 or comp_f % 50 == 0 or all_done:
                 pct = round((recv_c / tot_c * 100), 1) if tot_c else 100.0
@@ -1525,6 +1633,7 @@ def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_n
                     )
 
         if all_done:
+            close_all_cached_file_handles()
             finalize_db_wal()
 
         ack_payload = {
@@ -1543,7 +1652,6 @@ def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_n
         if all_done:
             push_receiving_active = False
             break
-
 def push_network_worker(worker_id, session_token, server_ip, server_port, srv_name):
     global push_receiving_active
     worker_socket = None
@@ -1631,6 +1739,7 @@ def stop_local_workers():
             s.close()
         except Exception:
             pass
+    close_all_cached_file_handles()
 
 
 def send_server_action(action_name):
@@ -1813,9 +1922,15 @@ def handle_invite_payload(payload, sender_ip):
         return "invalid"
 
     incoming_hash = (payload.get("password_hash") or "").strip()
-    if REQUIRES_PASSWORD and incoming_hash != CLIENT_PASSWORD_HASH:
-        print(f"[!] Rejected connection attempt from Server {sender_ip} (invalid client password).")
-        return "auth_failed"
+    incoming_hmac = (payload.get("auth_hmac") or "").strip()
+    incoming_nonce = (payload.get("auth_nonce") or CLIENT_AUTH_NONCE).strip()
+    if REQUIRES_PASSWORD:
+        expected_hmac = compute_auth_hmac(CLIENT_PASSWORD_HASH, incoming_nonce)
+        hmac_ok = bool(incoming_hmac and hmac.compare_digest(incoming_hmac, expected_hmac))
+        hash_ok = bool(incoming_hash and hmac.compare_digest(incoming_hash, CLIENT_PASSWORD_HASH))
+        if not (hmac_ok or hash_ok):
+            print(f"[!] Rejected connection attempt from Server {sender_ip} (invalid client password HMAC).")
+            return "auth_failed"
 
     target_ip = sender_ip
     preferred_ip = payload.get("preferred_server_ip")
@@ -2020,6 +2135,7 @@ def udp_beacon_and_probe_loop():
             "ip": get_local_ip(),
             "invite_port": bound_invite_port,
             "requires_password": REQUIRES_PASSWORD,
+            "auth_nonce": CLIENT_AUTH_NONCE,
             "waiting": not is_connected_to_server
         }).encode('utf-8')
         targets = [target_addr] if target_addr else get_client_broadcast_targets()
@@ -2530,68 +2646,178 @@ def configure_client_password_interactive():
             print("[!] Invalid choice. Enter 1 or 2.")
 
 
-def ensure_os_network_and_av_readiness():
-    """
-    Cross-platform network & antivirus readiness helper for EFT Client:
-    - Windows: Switches Public Wi-Fi to Private, removes Block rules on python.exe, and opens ports 8083-8098.
-    - Linux: Opens ports 8083-8098 if UFW is active.
-    - Android: Acquires termux-wake-lock so Doze Mode never drops transfers.
-    """
-    if CLIENT_OS == 'windows':
-        rule_name = "EFT_Client_v3_Inbound_Ready"
-        py_exe = os.path.abspath(sys.executable)
-        invite_port_range = f"{DEFAULT_INVITE_PORT}-{DEFAULT_INVITE_PORT + 15}"
-        save_dir_clean = os.path.abspath(CLIENT_SAVE_DIRECTORY)
+# Track exact pre-existing OS security state on Client so we can revert to the original state on exit
+import tempfile
 
-        needs_config = True
+# Track exact pre-existing OS security state on Client so we can revert to the original state on exit
+_os_security_snapshot = {
+    "modified": False,
+    "rule_name": "EFT_Client_v3_Inbound_Ready",
+    "rule_pre_existed": False,
+    "public_interface_aliases": [],
+    "disabled_block_rule_names": [],
+    "ufw_added": False,
+    "firewalld_added": False,
+    "wakelock_acquired": False
+}
+
+
+def _run_powershell_script_clean(ps_script, elevate_if_needed=True, wait_seconds=2.5):
+    """
+    Execute a plain-text PowerShell script via a temporary .ps1 file without Base64 (-EncodedCommand)
+    or -WindowStyle Hidden flags, avoiding false-positive heuristic detections (IDP.HELU.PSE94) in Avast/AVs
+    while still avoiding any command-line quote-escaping issues.
+    """
+    script_path = os.path.join(tempfile.gettempdir(), f"eft_client_fw_helper_{os.getpid()}.ps1")
+    try:
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(ps_script)
+
         try:
-            chk_ps = (
-                f'$r = Get-NetFirewallRule -DisplayName "{rule_name}" -ErrorAction SilentlyContinue; '
-                f'$pub = Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object {{ $_.NetworkCategory -eq "Public" }}; '
-                f'$blk = Get-NetFirewallApplicationFilter -Program "{py_exe}" -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Action -eq "Block" }}; '
-                f'if ($r -and (-not $pub) -and (-not $blk)) {{ Write-Output "READY" }}'
+            is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            is_admin = False
+
+        if is_admin or not elevate_if_needed:
+            return subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=8.0
             )
-            chk = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", chk_ps],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=4.0
+        else:
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", "powershell.exe",
+                f'-NoProfile -ExecutionPolicy Bypass -File "{script_path}"',
+                None, 1
             )
-            if "READY" in (chk.stdout or ""):
-                needs_config = False
+            if int(ret) > 32:
+                time.sleep(wait_seconds)
+                return True
+            return False
+    except Exception:
+        return False
+    finally:
+        try:
+            if os.path.exists(script_path):
+                os.remove(script_path)
         except Exception:
             pass
 
-        if needs_config:
-            print("[*] Windows Network Security: Switching Public profile to Private & clearing Python firewall blocks...")
-            ps_script = (
-                "Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object { $_.NetworkCategory -eq 'Public' } | Set-NetConnectionProfile -NetworkCategory Private -ErrorAction SilentlyContinue; "
-                "Get-NetFirewallRule -Action Block -Enabled True -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'python' } | Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
-                f"Get-NetFirewallApplicationFilter -Program '{py_exe}' -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Action -eq 'Block' }} | Remove-NetFirewallRule -ErrorAction SilentlyContinue; "
-                f"netsh advfirewall firewall delete rule name=\"{rule_name}\" >$null 2>&1; "
-                f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow protocol=TCP localport={invite_port_range} profile=any enable=yes >$null 2>&1; "
-                f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow protocol=UDP localport={CLIENT_PROBE_UDP_PORT} profile=any enable=yes >$null 2>&1; "
-                f"netsh advfirewall firewall add rule name=\"{rule_name}\" dir=in action=allow program=\"{py_exe}\" profile=any enable=yes >$null 2>&1; "
-                f"Add-MpPreference -ExclusionPath '{save_dir_clean}' -ErrorAction SilentlyContinue"
+
+def revert_os_network_and_av_changes():
+    """
+    Revert any temporary client firewall rules, re-enable any previously disabled Python Block rules,
+    and restore Public network profiles back to their exact original state before the script ran.
+    """
+    if not _os_security_snapshot.get("modified"):
+        return
+    _os_security_snapshot["modified"] = False
+
+    if CLIENT_OS == 'windows':
+        rule_name = _os_security_snapshot["rule_name"]
+        pub_ifaces = _os_security_snapshot["public_interface_aliases"]
+        disabled_rules = _os_security_snapshot["disabled_block_rule_names"]
+
+        ps_lines = ["$ErrorActionPreference = 'SilentlyContinue'"]
+        if not _os_security_snapshot["rule_pre_existed"]:
+            ps_lines.append(f'Remove-NetFirewallRule -DisplayName "{rule_name}"')
+        for rname in disabled_rules:
+            safe_rname = rname.replace('"', '`"')
+            ps_lines.append(f'Enable-NetFirewallRule -Name "{safe_rname}"')
+        for iface in pub_ifaces:
+            safe_iface = iface.replace('"', '`"')
+            ps_lines.append(
+                f'Set-NetConnectionProfile -InterfaceAlias "{safe_iface}" -NetworkCategory Public'
             )
 
-            try:
-                is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
-            except Exception:
-                is_admin = False
+        if len(ps_lines) > 1:
+            print("[*] Reverting Client Windows Firewall & Network Profile to original pre-EFT state...")
+            _run_powershell_script_clean("\n".join(ps_lines), elevate_if_needed=True, wait_seconds=1.5)
 
-            if is_admin:
-                subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                print("[*] Windows Network Security: Client Wi-Fi set to Private and firewall rules applied.")
-            else:
-                print("[*] Windows Security: Please click 'Yes' on the UAC prompt to switch Wi-Fi to Private and unblock ports...")
-                try:
-                    ret = ctypes.windll.shell32.ShellExecuteW(
-                        None, "runas", "powershell.exe", f'-NoProfile -ExecutionPolicy Bypass -Command "{ps_script}"', None, 1
-                    )
-                    if int(ret) > 32:
-                        time.sleep(2.2)
-                        print("[*] Windows Network Security: Client Wi-Fi profile switched to Private and rules applied.")
-                except Exception:
-                    pass
+    elif CLIENT_OS == 'linux':
+        try:
+            if _os_security_snapshot.get("ufw_added") and shutil.which("ufw"):
+                subprocess.run(
+                    f"sudo -n ufw delete allow {DEFAULT_INVITE_PORT}:8098/tcp && sudo -n ufw delete allow {CLIENT_PROBE_UDP_PORT}/udp",
+                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            elif _os_security_snapshot.get("firewalld_added") and shutil.which("firewall-cmd"):
+                subprocess.run(
+                    f"sudo -n firewall-cmd --remove-port={DEFAULT_INVITE_PORT}-8098/tcp --remove-port={CLIENT_PROBE_UDP_PORT}/udp",
+                    shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+        except Exception:
+            pass
+
+    elif CLIENT_OS == 'android':
+        if _os_security_snapshot.get("wakelock_acquired"):
+            release_android_wakelock()
+
+
+def ensure_os_network_and_av_readiness():
+    """
+    Cross-platform network readiness helper for EFT Client using a transparent .ps1 script
+    with full state snapshotting and automatic reversion on exit.
+    """
+    if "--no-system-tuning" in sys.argv:
+        print("[*] Skipping OS firewall tuning (--no-system-tuning active).")
+        return
+
+    if CLIENT_OS == 'windows':
+        rule_name = _os_security_snapshot["rule_name"]
+        py_exe = os.path.abspath(sys.executable)
+        invite_port_range = f"{DEFAULT_INVITE_PORT}-8098"
+
+        snap_ps = f"""
+$ErrorActionPreference = 'SilentlyContinue'$r = Get-NetFirewallRule -DisplayName "{rule_name}"
+if ($r) {{ Write-Output "RULE_EXISTS" }}
+Get-NetConnectionProfile | Where-Object {{ $_.NetworkCategory -eq 'Public' }} | ForEach-Object {{
+    Write-Output ("PUB_IFACE:" + $_.InterfaceAlias)
+}}
+$blk = Get-NetFirewallRule -Action Block -Enabled True -Direction Inbound | Where-Object {{
+    $_.DisplayName -match 'python' -or$_.Name -match 'python'
+}}
+$appBlk = Get-NetFirewallApplicationFilter | Where-Object {{$_.Program -match 'python' }} | Get-NetFirewallRule | Where-Object {{
+    $_.Action -eq 'Block' -and$_.Enabled -eq 'True'
+}}
+$allBlk = @()
+if ($blk) {{ $allBlk +=$blk }}
+if ($appBlk) {{$allBlk += $appBlk }}$allBlk | Select-Object -Unique -ExpandProperty Name | ForEach-Object {{
+    if ($_) {{ Write-Output ("BLK_RULE:" + $_) }}
+}}
+"""
+        try:
+            chk = _run_powershell_script_clean(snap_ps, elevate_if_needed=False)
+            out_lines = (chk.stdout or "").splitlines() if hasattr(chk, "stdout") else []
+            _os_security_snapshot["rule_pre_existed"] = ("RULE_EXISTS" in out_lines)
+            pub_ifaces = [l.split("PUB_IFACE:", 1)[1].strip() for l in out_lines if l.startswith("PUB_IFACE:")]
+            blk_rules = [l.split("BLK_RULE:", 1)[1].strip() for l in out_lines if l.startswith("BLK_RULE:")]
+            _os_security_snapshot["public_interface_aliases"] = pub_ifaces
+            _os_security_snapshot["disabled_block_rule_names"] = blk_rules
+        except Exception:
+            pub_ifaces = []
+            blk_rules = []
+
+        print("[*] Configuring temporary Client Windows Firewall session rules (TCP/UDP 8083-8098 + Ping across All Profiles)...")
+
+        apply_ps = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+Get-NetConnectionProfile | Where-Object {{ $_.NetworkCategory -eq 'Public' }} | Set-NetConnectionProfile -NetworkCategory Private
+Get-NetFirewallRule -Action Block -Enabled True -Direction Inbound | Where-Object {{
+    $_.DisplayName -match 'python' -or$_.Name -match 'python'
+}} | Disable-NetFirewallRule
+Get-NetFirewallApplicationFilter | Where-Object {{ $_.Program -match 'python' }} | Get-NetFirewallRule | Where-Object {{
+    $_.Action -eq 'Block' -and$_.Enabled -eq 'True'
+}} | Disable-NetFirewallRule
+Remove-NetFirewallRule -DisplayName "{rule_name}"
+New-NetFirewallRule -DisplayName "{rule_name}" -Direction Inbound -Action Allow -Protocol TCP -LocalPort {invite_port_range} -Profile Any -EdgeTraversalPolicy Allow | Out-Null
+New-NetFirewallRule -DisplayName "{rule_name}" -Direction Inbound -Action Allow -Protocol UDP -LocalPort {CLIENT_PROBE_UDP_PORT} -Profile Any -EdgeTraversalPolicy Allow | Out-Null
+New-NetFirewallRule -DisplayName "{rule_name}" -Direction Inbound -Action Allow -Protocol ICMPv4 -IcmpType 8 -Profile Any | Out-Null
+New-NetFirewallRule -DisplayName "{rule_name}" -Direction Inbound -Action Allow -Program "{py_exe}" -Profile Any -EdgeTraversalPolicy Allow | Out-Null
+"""
+        res = _run_powershell_script_clean(apply_ps, elevate_if_needed=True, wait_seconds=2.5)
+        if res:
+            _os_security_snapshot["modified"] = True
+            print("[*] Temporary Client firewall rules applied across all profiles (will auto-revert when Client exits).")
 
     elif CLIENT_OS == 'linux':
         try:
@@ -2599,6 +2825,16 @@ def ensure_os_network_and_av_readiness():
                 ufw_st = subprocess.run("ufw status", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 if "Status: active" in (ufw_st.stdout or "") and str(DEFAULT_INVITE_PORT) not in (ufw_st.stdout or ""):
                     subprocess.run(f"sudo ufw allow {DEFAULT_INVITE_PORT}:8098/tcp && sudo ufw allow {CLIENT_PROBE_UDP_PORT}/udp", shell=True)
+                    _os_security_snapshot["ufw_added"] = True
+                    _os_security_snapshot["modified"] = True
+            elif shutil.which("firewall-cmd"):
+                fw_st = subprocess.run("firewall-cmd --state", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if "running" in (fw_st.stdout or "").lower():
+                    ports_chk = subprocess.run("firewall-cmd --list-ports", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if f"{DEFAULT_INVITE_PORT}/tcp" not in (ports_chk.stdout or ""):
+                        subprocess.run(f"sudo firewall-cmd --add-port={DEFAULT_INVITE_PORT}-8098/tcp --add-port={CLIENT_PROBE_UDP_PORT}/udp", shell=True)
+                        _os_security_snapshot["firewalld_added"] = True
+                        _os_security_snapshot["modified"] = True
         except Exception:
             pass
 
@@ -2606,9 +2842,10 @@ def ensure_os_network_and_av_readiness():
         if shutil.which("termux-wake-lock"):
             try:
                 subprocess.run("termux-wake-lock", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _os_security_snapshot["wakelock_acquired"] = True
+                _os_security_snapshot["modified"] = True
             except Exception:
                 pass
-
 
 def main_client_loop():
     global client_running, active_server_ip, active_server_port
@@ -2646,13 +2883,67 @@ def main_client_loop():
                 if active_server_ip:
                     run_control_session(active_server_ip, active_server_port)
     except KeyboardInterrupt:
-        print("\n[*] Ctrl+C on client: stopping active workers and cleaning up WAL files...")
+        print("\n[*] Ctrl+C on client: stopping active workers, reverting firewall/wake-lock, and cleaning up WAL files...")
         client_running = False
         if transfer_active or push_receiving_active:
             stop_local_workers()
             update_client_session_state_on_action(master_session_token, "cancel_transfer")
             send_server_action("cancel_transfer")
+    finally:
+        client_running = False
+        revert_os_network_and_av_changes()
         close_db_cleanly()
+
+
+def configure_client_firewall_interactive():
+    """
+    Prompt the client operator for explicit consent before modifying OS firewall rules on Windows or Linux.
+    (Automatically skipped on Android where no OS firewall rules are modified).
+    Returns True to continue starting the client, or False to exit.
+    """
+    if "--no-system-tuning" in sys.argv or CLIENT_OS not in ('windows', 'linux'):
+        return True
+
+    print("\n" + "-" * 72)
+    print(" 🛡️  CLIENT OS FIREWALL & NETWORK PROFILE CONFIGURATION")
+    print("-" * 72)
+    if CLIENT_OS == 'windows':
+        print("  To allow instant Server Web UI click-to-connect and reverse worker streams,")
+        print("  EFT Client can temporarily configure Windows Firewall for this session:")
+        print("   • Switch active 'Public' network profile to 'Private' (restored on exit)")
+        print("   • Temporarily disable any inbound 'Block' rules on python.exe")
+        print("   • Allow inbound TCP ports 8083-8098, UDP 8084 & Ping (removed on exit)")
+        print("  All changes are snapshotted and automatically reverted when Client stops.")
+    else:
+        print("  To allow instant Server Web UI click-to-connect and reverse worker streams,")
+        print("  EFT Client can temporarily open TCP ports 8083-8098 & UDP 8084 in UFW /")
+        print("  firewalld for this session and automatically remove them when Client stops.")
+    print("-" * 72)
+    print("  1. Accept & Configure Temporary Firewall Rules (Default — Recommended)")
+    print("  2. Reject & Continue Without Modifying Firewall")
+    print("  3. Exit")
+    print("-" * 72)
+
+    while True:
+        try:
+            sub = input("Select firewall option [1-3, default=1]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[*] Exiting EFT Client.")
+            return False
+
+        if sub in ('', '1'):
+            print("[*] Firewall Mode: ACCEPTED (Temporary session rules will be applied & auto-reverted on exit)")
+            return True
+        elif sub == '2':
+            if "--no-system-tuning" not in sys.argv:
+                sys.argv.append("--no-system-tuning")
+            print("[*] Firewall Mode: REJECTED (Continuing without modifying OS firewall)")
+            return True
+        elif sub == '3':
+            print("[*] Exiting EFT Client.")
+            return False
+        else:
+            print("[!] Invalid choice. Please enter 1, 2, or 3.")
 
 
 def run_startup_menu():
@@ -2677,6 +2968,9 @@ def run_startup_menu():
             break
 
         if choice in ('1', ''):
+            if not configure_client_firewall_interactive():
+                close_db_cleanly()
+                break
             configure_client_password_interactive()
             main_client_loop()
             break
