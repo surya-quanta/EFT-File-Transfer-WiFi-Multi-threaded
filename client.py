@@ -252,20 +252,32 @@ def get_file_lock(file_id):
         return file_locks[file_id]
 
 
+def win_long_path(path):
+    """Prefix Windows paths with '\\\\?\\' so paths longer than 260 characters never raise [WinError 206]."""
+    if not path or CLIENT_OS != 'windows':
+        return path
+    p = os.path.abspath(str(path))
+    if p.startswith('\\\\?\\'):
+        return p
+    if p.startswith('\\\\'):
+        return '\\\\?\\UNC\\' + p[2:]
+    return '\\\\?\\' + p
+
+
 def get_cached_file_handle(file_id, final_path, file_size):
     """Return a cached r+b file handle for file_id (creating/truncating lazily on first chunk write). Caller must hold get_file_lock(file_id)."""
     fh = open_file_handles.get(file_id)
     if fh is not None and not fh.closed:
         return fh
-    if not os.path.exists(final_path):
-        os.makedirs(os.path.dirname(final_path), exist_ok=True)
-        with open(final_path, 'wb') as f_init:
+    safe_p = win_long_path(final_path)
+    if not os.path.exists(safe_p):
+        os.makedirs(os.path.dirname(safe_p), exist_ok=True)
+        with open(safe_p, 'wb') as f_init:
             if file_size > 0:
                 f_init.truncate(file_size)
-    fh = open(final_path, 'r+b')
+    fh = open(safe_p, 'r+b')
     open_file_handles[file_id] = fh
     return fh
-
 
 def close_cached_file_handle(file_id):
     fh = open_file_handles.pop(file_id, None)
@@ -316,8 +328,9 @@ def cleanup_empty_parent_dirs(file_path, base_dir):
     parent = os.path.abspath(os.path.dirname(file_path))
     while parent.startswith(base_abs) and parent != base_abs:
         try:
-            if os.path.exists(parent) and not os.listdir(parent):
-                os.rmdir(parent)
+            safe_parent = win_long_path(parent)
+            if os.path.exists(safe_parent) and not os.listdir(safe_parent):
+                os.rmdir(safe_parent)
                 parent = os.path.abspath(os.path.dirname(parent))
             else:
                 break
@@ -701,11 +714,13 @@ def perform_client_push_cancel(session_token):
 
         for file_id, rel_path, save_path, pre_existed in incomplete_files:
             target = save_path if save_path else resolve_local_save_path(base_save_dir, rel_path)
+            safe_target = win_long_path(target)
             flock = get_file_lock(file_id)
             with flock:
-                if target and os.path.exists(target) and not pre_existed:
+                close_cached_file_handle(file_id)
+                if target and os.path.exists(safe_target) and not pre_existed:
                     try:
-                        os.remove(target)
+                        os.remove(safe_target)
                         cleanup_empty_parent_dirs(target, base_save_dir)
                         removed_count += 1
                     except Exception as e:
@@ -760,17 +775,20 @@ def perform_client_push_rollback(session_token):
 
         for rel_path, (file_id, save_path, pre_existed) in files_to_remove.items():
             target = save_path if save_path else resolve_local_save_path(base_save_dir, rel_path)
+            safe_target = win_long_path(target)
             flock = get_file_lock(file_id) if file_id else threading.Lock()
             with flock:
-                if target and os.path.exists(target) and not pre_existed:
+                if file_id:
+                    close_cached_file_handle(file_id)
+                if target and os.path.exists(safe_target) and not pre_existed:
                     try:
-                        if os.path.isdir(target):
-                            if not os.listdir(target):
-                                os.rmdir(target)
+                        if os.path.isdir(safe_target):
+                            if not os.listdir(safe_target):
+                                os.rmdir(safe_target)
                                 cleanup_empty_parent_dirs(target, base_save_dir)
                                 removed_count += 1
                         else:
-                            os.remove(target)
+                            os.remove(safe_target)
                             cleanup_empty_parent_dirs(target, base_save_dir)
                             removed_count += 1
                     except Exception as e:
@@ -927,10 +945,11 @@ import stat as stat_module
 def is_regular_readable_file(path):
     """Fast metadata-only check: returns True ONLY for real non-symlink regular files (skips sockets, FIFOs, symlinks)."""
     try:
-        st = os.lstat(path)
+        sp = win_long_path(path)
+        st = os.lstat(sp)
         if not stat_module.S_ISREG(st.st_mode):
             return False
-        return os.access(path, os.R_OK)
+        return os.access(sp, os.R_OK)
     except (PermissionError, OSError):
         return False
 
@@ -941,16 +960,17 @@ def build_manifest(target_paths):
 
     for raw_target in target_paths:
         target_path = os.path.abspath(os.path.expanduser(raw_target))
-        if not os.path.exists(target_path):
+        safe_target = win_long_path(target_path)
+        if not os.path.exists(safe_target):
             continue
 
         parent_dir = os.path.dirname(target_path.rstrip('/\\'))
 
-        if os.path.isfile(target_path):
+        if os.path.isfile(safe_target):
             if not is_regular_readable_file(target_path):
                 continue
             try:
-                stat = os.stat(target_path)
+                stat = os.stat(safe_target)
                 rel_path = normalize_rel_path(os.path.basename(target_path))
                 manifest["files"].append({
                     "relative_path": rel_path,
@@ -964,9 +984,9 @@ def build_manifest(target_paths):
             except (PermissionError, OSError):
                 continue
 
-        elif os.path.isdir(target_path):
+        elif os.path.isdir(safe_target):
             for root, dirs, files in os.walk(target_path, followlinks=False):
-                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+                dirs[:] = [d for d in dirs if not os.path.islink(win_long_path(os.path.join(root, d)))]
                 valid_files_in_dir = 0
 
                 for file in files:
@@ -974,7 +994,7 @@ def build_manifest(target_paths):
                     if not is_regular_readable_file(full_path):
                         continue
                     try:
-                        stat = os.stat(full_path)
+                        stat = os.stat(win_long_path(full_path))
                         rel_raw = os.path.relpath(full_path, parent_dir)
                         rel_path = normalize_rel_path(rel_raw)
                         manifest["files"].append({
@@ -992,7 +1012,7 @@ def build_manifest(target_paths):
 
                 if valid_files_in_dir == 0 and not dirs:
                     try:
-                        stat = os.stat(root)
+                        stat = os.stat(win_long_path(root))
                         rel_dir = normalize_rel_path(os.path.relpath(root, parent_dir))
                         if rel_dir:
                             manifest["dirs"].append({
@@ -1065,7 +1085,7 @@ def process_and_compress_chunks(local_mapping, manifest, chunk_queue, missing_ma
         full_path = local_mapping.get(rel_path)
 
         try:
-            with open(full_path, 'rb') as f:
+            with open(win_long_path(full_path), 'rb') as f:
                 for chunk_index in missing_indices:
                     if not transfer_active:
                         break
@@ -1240,7 +1260,7 @@ def prepare_push_session_on_client(cmd, c_sock):
     Handle incoming start_push_transfer from Server:
     1. Verify sufficient free disk space via shutil.disk_usage().
     2. Detect modified source files on Resume (size or mtime mismatch) and invalidate stale chunks.
-    3. Create empty folders & 0-byte files upfront; non-empty files are allocated lazily on first chunk write.
+    3. Create empty folders & 0-byte files upfront (with >260 char support on Windows); non-empty files are allocated lazily on first chunk write.
     4. Reply with push_manifest_processed so the Server can start its chunk producer.
     """
     global master_session_token
@@ -1258,7 +1278,7 @@ def prepare_push_session_on_client(cmd, c_sock):
     if not dest_dir or dest_dir == "DRIVES":
         dest_dir = LAST_BROWSED_DIR if (LAST_BROWSED_DIR and LAST_BROWSED_DIR != "DRIVES") else CLIENT_SAVE_DIRECTORY
     dest_dir = os.path.abspath(os.path.expanduser(dest_dir))
-    os.makedirs(dest_dir, exist_ok=True)
+    os.makedirs(win_long_path(dest_dir), exist_ok=True)
 
     srv_name = cmd.get("server_hostname") or active_server_hostname
     srv_ip = cmd.get("server_ip") or active_server_ip
@@ -1278,206 +1298,223 @@ def prepare_push_session_on_client(cmd, c_sock):
     with db_lock:
         state_conn.execute("BEGIN IMMEDIATE")
         history_conn.execute("BEGIN IMMEDIATE")
-        existing_sess = history_conn.execute(
-            "SELECT started_at FROM transfer_sessions WHERE session_token=?", (token,)
-        ).fetchone()
-        started_at = existing_sess[0] if (existing_sess and existing_sess[0]) else now_ts
+        try:
+            existing_sess = history_conn.execute(
+                "SELECT started_at FROM transfer_sessions WHERE session_token=?", (token,)
+            ).fetchone()
+            started_at = existing_sess[0] if (existing_sess and existing_sess[0]) else now_ts
 
-        history_conn.execute("""
-            INSERT OR REPLACE INTO transfer_sessions (
-                session_token, title, direction,
-                server_name, server_ip, server_os,
-                client_id, client_name, client_ip, client_os,
-                source_paths, destination_path, started_at, updated_at,
-                total_files, completed_files, total_bytes, transferred_bytes,
-                total_chunks, received_chunks, status
-            ) VALUES (?, ?, 'push', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0, 0, 'active')
-        """, (
-            token, sess_title,
-            srv_name, srv_ip, srv_os,
-            CLIENT_ID, CLIENT_HOSTNAME, c_ip, CLIENT_OS,
-            json.dumps(source_paths), dest_dir, started_at, now_ts,
-            len(files), total_bytes
-        ))
-
-        # 1. Create and log empty directories on client storage
-        for dinfo in empty_dirs:
-            norm_dir = normalize_rel_path(dinfo.get("relative_path", ""))
-            if not norm_dir:
-                continue
-            dir_save_path = resolve_local_save_path(dest_dir, norm_dir)
-            dir_pre = 1 if os.path.exists(dir_save_path) else 0
-            os.makedirs(dir_save_path, exist_ok=True)
-            try:
-                os.utime(dir_save_path, (dinfo.get("atime", now_ts), dinfo.get("mtime", now_ts)))
-            except Exception:
-                pass
-
-            dir_rel_display = norm_dir.rstrip('/') + '/'
-            pre_existed_map[dir_rel_display] = dir_pre
             history_conn.execute("""
-                INSERT INTO transfer_history_files (
-                    session_token, file_id, relative_path, source_path, save_path, size,
-                    mtime, atime, pre_existed, status, transferred_at
-                ) VALUES (?, 0, ?, ?, ?, 0, ?, ?, ?, 'completed', ?)
-                ON CONFLICT(session_token, relative_path) DO UPDATE SET
-                    save_path = excluded.save_path,
-                    status = 'completed',
-                    transferred_at = COALESCE(transfer_history_files.transferred_at, excluded.transferred_at)
+                INSERT OR REPLACE INTO transfer_sessions (
+                    session_token, title, direction,
+                    server_name, server_ip, server_os,
+                    client_id, client_name, client_ip, client_os,
+                    source_paths, destination_path, started_at, updated_at,
+                    total_files, completed_files, total_bytes, transferred_bytes,
+                    total_chunks, received_chunks, status
+                ) VALUES (?, ?, 'push', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0, 0, 'active')
             """, (
-                token, dir_rel_display, dinfo.get("source_path") or norm_dir,
-                dir_save_path, dinfo.get("mtime", now_ts), dinfo.get("atime", now_ts),
-                dir_pre, now_ts
+                token, sess_title,
+                srv_name, srv_ip, srv_os,
+                CLIENT_ID, CLIENT_HOSTNAME, c_ip, CLIENT_OS,
+                json.dumps(source_paths), dest_dir, started_at, now_ts,
+                len(files), total_bytes
             ))
 
-        # 2. Populate client_transfer_state.db and detect modified source files on Resume
-        for finfo in files:
-            norm_rel = normalize_rel_path(finfo["relative_path"])
-            src_full_path = finfo.get("source_path") or norm_rel
-            final_path = resolve_local_save_path(dest_dir, norm_rel)
-
-            cur = state_conn.execute(
-                "SELECT file_id, save_path, pre_existed, size, mtime FROM files WHERE session_token=? AND relative_path=?",
-                (token, norm_rel)
-            )
-            existing = cur.fetchone()
-            if existing:
-                old_fid, old_save_p, old_pre, old_size, old_mtime = existing
-                # Remark #2: If source file size or mtime changed since Pause/Interrupt, invalidate old chunks!
-                if old_size != finfo["size"] or abs((old_mtime or 0.0) - (finfo["mtime"] or 0.0)) > 1e-3:
-                    close_cached_file_handle(old_fid)
-                    state_conn.execute("DELETE FROM chunks WHERE file_id=?", (old_fid,))
-                    state_conn.execute("DELETE FROM files WHERE file_id=?", (old_fid,))
-                    if old_save_p and os.path.exists(old_save_p) and not old_pre:
-                        try:
-                            os.remove(old_save_p)
-                        except Exception:
-                            pass
-                    existing = None
-
-            if existing:
-                file_id = existing[0]
-                if existing[1]:
-                    final_path = existing[1]
-                pre_existed = existing[2]
-            else:
-                pre_existed = 1 if (os.path.exists(final_path) and os.path.getsize(final_path) == finfo["size"]) else 0
-                cur = state_conn.execute(
-                    """INSERT INTO files (session_token, relative_path, source_path, save_path, size, mtime, atime, pre_existed)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (token, norm_rel, src_full_path, final_path, finfo["size"], finfo["mtime"], finfo["atime"], pre_existed)
-                )
-                file_id = cur.lastrowid
-                if finfo["size"] == 0:
-                    state_conn.execute(
-                        "INSERT INTO chunks (file_id, chunk_index, status) VALUES (?, 0, 'received')",
-                        (file_id,)
-                    )
-                else:
-                    tot_f_chunks = max(1, math.ceil(finfo["size"] / CHUNK_SIZE))
-                    for idx in range(tot_f_chunks):
-                        state_conn.execute(
-                            "INSERT INTO chunks (file_id, chunk_index, status) VALUES (?, ?, 'pending')",
-                            (file_id, idx)
-                        )
-
-            pre_existed_map[norm_rel] = pre_existed
-
-            # Remark #1: Only create 0-byte files upfront; non-empty files are created lazily on first chunk write!
-            if finfo["size"] == 0 and not os.path.exists(final_path):
+            # 1. Create and log empty directories on client storage
+            for dinfo in empty_dirs:
+                norm_dir = normalize_rel_path(dinfo.get("relative_path", ""))
+                if not norm_dir:
+                    continue
+                dir_save_path = resolve_local_save_path(dest_dir, norm_dir)
+                safe_dir_path = win_long_path(dir_save_path)
+                dir_pre = 1 if os.path.exists(safe_dir_path) else 0
+                os.makedirs(safe_dir_path, exist_ok=True)
                 try:
-                    os.makedirs(os.path.dirname(final_path), exist_ok=True)
-                    with open(final_path, 'wb') as _:
-                        pass
-                    os.utime(final_path, (finfo["atime"], finfo["mtime"]))
+                    os.utime(safe_dir_path, (dinfo.get("atime", now_ts), dinfo.get("mtime", now_ts)))
                 except Exception:
                     pass
 
-            cur = state_conn.execute(
-                "SELECT chunk_index FROM chunks WHERE file_id=? AND status='pending'",
-                (file_id,)
-            )
-            missing_chunks = [r[0] for r in cur.fetchall()]
-            file_status = 'completed' if len(missing_chunks) == 0 else 'pending'
-            file_done_ts = now_ts if file_status == 'completed' else None
+                dir_rel_display = norm_dir.rstrip('/') + '/'
+                pre_existed_map[dir_rel_display] = dir_pre
+                history_conn.execute("""
+                    INSERT INTO transfer_history_files (
+                        session_token, file_id, relative_path, source_path, save_path, size,
+                        mtime, atime, pre_existed, status, transferred_at
+                    ) VALUES (?, 0, ?, ?, ?, 0, ?, ?, ?, 'completed', ?)
+                    ON CONFLICT(session_token, relative_path) DO UPDATE SET
+                        save_path = excluded.save_path,
+                        status = 'completed',
+                        transferred_at = COALESCE(transfer_history_files.transferred_at, excluded.transferred_at)
+                """, (
+                    token, dir_rel_display, dinfo.get("source_path") or norm_dir,
+                    dir_save_path, dinfo.get("mtime", now_ts), dinfo.get("atime", now_ts),
+                    dir_pre, now_ts
+                ))
 
-            history_conn.execute("""
-                INSERT INTO transfer_history_files (
-                    session_token, file_id, relative_path, source_path, save_path, size,
-                    mtime, atime, pre_existed, status, transferred_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(session_token, relative_path) DO UPDATE SET
-                    file_id = excluded.file_id,
-                    source_path = excluded.source_path,
-                    save_path = excluded.save_path,
-                    pre_existed = excluded.pre_existed,
-                    status = CASE WHEN transfer_history_files.status = 'completed' THEN 'completed' ELSE excluded.status END,
-                    transferred_at = COALESCE(transfer_history_files.transferred_at, excluded.transferred_at)
-            """, (
-                token, file_id, norm_rel, src_full_path, final_path, finfo["size"],
-                finfo["mtime"], finfo["atime"], pre_existed, file_status, file_done_ts
-            ))
+            # 2. Populate client_transfer_state.db and detect modified source files on Resume
+            for finfo in files:
+                norm_rel = normalize_rel_path(finfo["relative_path"])
+                src_full_path = finfo.get("source_path") or norm_rel
+                final_path = resolve_local_save_path(dest_dir, norm_rel)
+                safe_final_path = win_long_path(final_path)
 
-            if missing_chunks:
-                missing_map[norm_rel] = {
-                    "file_id": file_id,
-                    "missing": missing_chunks,
-                    "save_path": final_path,
-                    "pre_existed": pre_existed
-                }
-                if not os.path.exists(final_path):
-                    required_missing_bytes += finfo["size"]
-            else:
-                already_completed.append(norm_rel)
+                cur = state_conn.execute(
+                    "SELECT file_id, save_path, pre_existed, size, mtime FROM files WHERE session_token=? AND relative_path=?",
+                    (token, norm_rel)
+                )
+                existing = cur.fetchone()
+                if existing:
+                    old_fid, old_save_p, old_pre, old_size, old_mtime = existing
+                    # Remark #2: If source file size or mtime changed since Pause/Interrupt, invalidate old chunks!
+                    if old_size != finfo["size"] or abs((old_mtime or 0.0) - (finfo["mtime"] or 0.0)) > 1e-3:
+                        close_cached_file_handle(old_fid)
+                        state_conn.execute("DELETE FROM chunks WHERE file_id=?", (old_fid,))
+                        state_conn.execute("DELETE FROM files WHERE file_id=?", (old_fid,))
+                        if old_save_p and os.path.exists(win_long_path(old_save_p)) and not old_pre:
+                            try:
+                                os.remove(win_long_path(old_save_p))
+                            except Exception:
+                                pass
+                        existing = None
 
-        # Remark #3: Pre-Flight Disk Space Check (ENOSPC) before streaming chunks
-        try:
-            free_disk_bytes = shutil.disk_usage(dest_dir).free
-        except Exception:
-            free_disk_bytes = None
+                if existing:
+                    file_id = existing[0]
+                    if existing[1]:
+                        final_path = existing[1]
+                        safe_final_path = win_long_path(final_path)
+                    pre_existed = existing[2]
+                else:
+                    pre_existed = 1 if (os.path.exists(safe_final_path) and os.path.getsize(safe_final_path) == finfo["size"]) else 0
+                    cur = state_conn.execute(
+                        """INSERT INTO files (session_token, relative_path, source_path, save_path, size, mtime, atime, pre_existed)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (token, norm_rel, src_full_path, final_path, finfo["size"], finfo["mtime"], finfo["atime"], pre_existed)
+                    )
+                    file_id = cur.lastrowid
+                    if finfo["size"] == 0:
+                        state_conn.execute(
+                            "INSERT INTO chunks (file_id, chunk_index, status) VALUES (?, 0, 'received')",
+                            (file_id,)
+                        )
+                    else:
+                        tot_f_chunks = max(1, math.ceil(finfo["size"] / CHUNK_SIZE))
+                        for idx in range(tot_f_chunks):
+                            state_conn.execute(
+                                "INSERT INTO chunks (file_id, chunk_index, status) VALUES (?, ?, 'pending')",
+                                (file_id, idx)
+                            )
 
-        if free_disk_bytes is not None and required_missing_bytes > free_disk_bytes:
-            state_conn.execute("ROLLBACK")
-            history_conn.execute("ROLLBACK")
-            finalize_db_wal()
-            err_msg = (
-                f"Insufficient disk space on client ({dest_dir}): "
-                f"Need {format_bytes_human(required_missing_bytes)}, have {format_bytes_human(free_disk_bytes)} free."
-            )
-            with console_print_lock:
-                print(f"[!] PUSH Rejected: {err_msg}")
+                pre_existed_map[norm_rel] = pre_existed
+
+                # Remark #1: Only create 0-byte files upfront; non-empty files are created lazily on first chunk write!
+                if finfo["size"] == 0 and not os.path.exists(safe_final_path):
+                    try:
+                        os.makedirs(os.path.dirname(safe_final_path), exist_ok=True)
+                        with open(safe_final_path, 'wb') as _:
+                            pass
+                        os.utime(safe_final_path, (finfo["atime"], finfo["mtime"]))
+                    except Exception:
+                        pass
+
+                cur = state_conn.execute(
+                    "SELECT chunk_index FROM chunks WHERE file_id=? AND status='pending'",
+                    (file_id,)
+                )
+                missing_chunks = [r[0] for r in cur.fetchall()]
+                file_status = 'completed' if len(missing_chunks) == 0 else 'pending'
+                file_done_ts = now_ts if file_status == 'completed' else None
+
+                history_conn.execute("""
+                    INSERT INTO transfer_history_files (
+                        session_token, file_id, relative_path, source_path, save_path, size,
+                        mtime, atime, pre_existed, status, transferred_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_token, relative_path) DO UPDATE SET
+                        file_id = excluded.file_id,
+                        source_path = excluded.source_path,
+                        save_path = excluded.save_path,
+                        pre_existed = excluded.pre_existed,
+                        status = CASE WHEN transfer_history_files.status = 'completed' THEN 'completed' ELSE excluded.status END,
+                        transferred_at = COALESCE(transfer_history_files.transferred_at, excluded.transferred_at)
+                """, (
+                    token, file_id, norm_rel, src_full_path, final_path, finfo["size"],
+                    finfo["mtime"], finfo["atime"], pre_existed, file_status, file_done_ts
+                ))
+
+                if missing_chunks:
+                    missing_map[norm_rel] = {
+                        "file_id": file_id,
+                        "missing": missing_chunks,
+                        "save_path": final_path,
+                        "pre_existed": pre_existed
+                    }
+                    if not os.path.exists(safe_final_path):
+                        required_missing_bytes += finfo["size"]
+                else:
+                    already_completed.append(norm_rel)
+
+            # Remark #3: Pre-Flight Disk Space Check (ENOSPC) before streaming chunks
             try:
-                with control_send_lock:
-                    c_sock.sendall((json.dumps({
-                        "action": "push_manifest_processed",
-                        "status": "disk_full",
-                        "session_token": token,
-                        "message": err_msg
-                    }) + "\n").encode('utf-8'))
+                free_disk_bytes = shutil.disk_usage(win_long_path(dest_dir)).free
+            except Exception:
+                free_disk_bytes = None
+
+            if free_disk_bytes is not None and required_missing_bytes > free_disk_bytes:
+                state_conn.execute("ROLLBACK")
+                history_conn.execute("ROLLBACK")
+                finalize_db_wal()
+                err_msg = (
+                    f"Insufficient disk space on client ({dest_dir}): "
+                    f"Need {format_bytes_human(required_missing_bytes)}, have {format_bytes_human(free_disk_bytes)} free."
+                )
+                with console_print_lock:
+                    print(f"[!] PUSH Rejected: {err_msg}")
+                try:
+                    with control_send_lock:
+                        c_sock.sendall((json.dumps({
+                            "action": "push_manifest_processed",
+                            "status": "disk_full",
+                            "session_token": token,
+                            "message": err_msg
+                        }) + "\n").encode('utf-8'))
+                except Exception:
+                    pass
+                return
+
+            c_row = state_conn.execute("""
+                SELECT COUNT(*), SUM(CASE WHEN c.status='received' THEN 1 ELSE 0 END)
+                FROM chunks c
+                INNER JOIN files f ON c.file_id = f.file_id
+                WHERE f.session_token = ?
+            """, (token,)).fetchone()
+            tot_c = c_row[0] or 0
+            recv_c = c_row[1] or 0
+            is_all_done = (tot_c == recv_c)
+
+            sync_client_session_progress(
+                token,
+                received_chunks=recv_c,
+                total_chunks=tot_c,
+                override_status='completed' if is_all_done else 'active'
+            )
+            state_conn.execute("COMMIT")
+            history_conn.execute("COMMIT")
+            if is_all_done:
+                finalize_db_wal()
+        except Exception as e:
+            try:
+                state_conn.execute("ROLLBACK")
             except Exception:
                 pass
-            return
-
-        c_row = state_conn.execute("""
-            SELECT COUNT(*), SUM(CASE WHEN c.status='received' THEN 1 ELSE 0 END)
-            FROM chunks c
-            INNER JOIN files f ON c.file_id = f.file_id
-            WHERE f.session_token = ?
-        """, (token,)).fetchone()
-        tot_c = c_row[0] or 0
-        recv_c = c_row[1] or 0
-        is_all_done = (tot_c == recv_c)
-
-        sync_client_session_progress(
-            token,
-            received_chunks=recv_c,
-            total_chunks=tot_c,
-            override_status='completed' if is_all_done else 'active'
-        )
-        state_conn.execute("COMMIT")
-        history_conn.execute("COMMIT")
-        if is_all_done:
+            try:
+                history_conn.execute("ROLLBACK")
+            except Exception:
+                pass
             finalize_db_wal()
+            with console_print_lock:
+                print(f"[!] Error preparing PUSH session on client: {e}")
+            return
 
     with console_print_lock:
         print(
@@ -1505,7 +1542,6 @@ def prepare_push_session_on_client(cmd, c_sock):
             c_sock.sendall((json.dumps(reply) + "\n").encode('utf-8'))
     except Exception:
         pass
-
 
 def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_name):
     """Receive compressed PUSH chunks over an already-authenticated worker_socket with handle caching & O(1) SQLite updates."""
@@ -1620,7 +1656,7 @@ def receive_push_chunks_on_socket(worker_socket, session_token, server_ip, srv_n
             with flock:
                 close_cached_file_handle(file_id)
                 try:
-                    os.utime(final_path, (atime, mtime))
+                    os.utime(win_long_path(final_path), (atime, mtime))
                 except Exception:
                     pass
             release_file_lock(file_id)
@@ -2768,20 +2804,22 @@ def ensure_os_network_and_av_readiness():
         invite_port_range = f"{DEFAULT_INVITE_PORT}-8098"
 
         snap_ps = f"""
-$ErrorActionPreference = 'SilentlyContinue'$r = Get-NetFirewallRule -DisplayName "{rule_name}"
+$ErrorActionPreference = 'SilentlyContinue'
+$r = Get-NetFirewallRule -DisplayName "{rule_name}"
 if ($r) {{ Write-Output "RULE_EXISTS" }}
 Get-NetConnectionProfile | Where-Object {{ $_.NetworkCategory -eq 'Public' }} | ForEach-Object {{
     Write-Output ("PUB_IFACE:" + $_.InterfaceAlias)
 }}
 $blk = Get-NetFirewallRule -Action Block -Enabled True -Direction Inbound | Where-Object {{
-    $_.DisplayName -match 'python' -or$_.Name -match 'python'
+    ($_.DisplayName -match 'python') -or ($_.Name -match 'python')
 }}
-$appBlk = Get-NetFirewallApplicationFilter | Where-Object {{$_.Program -match 'python' }} | Get-NetFirewallRule | Where-Object {{
-    $_.Action -eq 'Block' -and$_.Enabled -eq 'True'
+$appBlk = Get-NetFirewallApplicationFilter | Where-Object {{ $_.Program -match 'python' }} | Get-NetFirewallRule | Where-Object {{
+    ($_.Action -eq 'Block') -and ($_.Enabled -eq 'True')
 }}
 $allBlk = @()
-if ($blk) {{ $allBlk +=$blk }}
-if ($appBlk) {{$allBlk += $appBlk }}$allBlk | Select-Object -Unique -ExpandProperty Name | ForEach-Object {{
+if ($blk) {{ $allBlk += $blk }}
+if ($appBlk) {{ $allBlk += $appBlk }}
+$allBlk | Select-Object -Unique -ExpandProperty Name | ForEach-Object {{
     if ($_) {{ Write-Output ("BLK_RULE:" + $_) }}
 }}
 """
@@ -2803,10 +2841,10 @@ if ($appBlk) {{$allBlk += $appBlk }}$allBlk | Select-Object -Unique -ExpandPrope
 $ErrorActionPreference = 'SilentlyContinue'
 Get-NetConnectionProfile | Where-Object {{ $_.NetworkCategory -eq 'Public' }} | Set-NetConnectionProfile -NetworkCategory Private
 Get-NetFirewallRule -Action Block -Enabled True -Direction Inbound | Where-Object {{
-    $_.DisplayName -match 'python' -or$_.Name -match 'python'
+    ($_.DisplayName -match 'python') -or ($_.Name -match 'python')
 }} | Disable-NetFirewallRule
 Get-NetFirewallApplicationFilter | Where-Object {{ $_.Program -match 'python' }} | Get-NetFirewallRule | Where-Object {{
-    $_.Action -eq 'Block' -and$_.Enabled -eq 'True'
+    ($_.Action -eq 'Block') -and ($_.Enabled -eq 'True')
 }} | Disable-NetFirewallRule
 Remove-NetFirewallRule -DisplayName "{rule_name}"
 New-NetFirewallRule -DisplayName "{rule_name}" -Direction Inbound -Action Allow -Protocol TCP -LocalPort {invite_port_range} -Profile Any -EdgeTraversalPolicy Allow | Out-Null
