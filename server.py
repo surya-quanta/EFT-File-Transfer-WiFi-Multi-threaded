@@ -176,6 +176,36 @@ dir_result_event = threading.Event()
 server_running = True
 
 
+conflict_lock = threading.Lock()
+pending_conflict_data = None
+conflict_resolution_result = None
+conflict_resolution_event = threading.Event()
+
+
+def request_local_conflict_resolution(conflict_descriptor):
+    global pending_conflict_data, conflict_resolution_result
+    with conflict_lock:
+        pending_conflict_data = conflict_descriptor
+        conflict_resolution_result = None
+        conflict_resolution_event.clear()
+
+    conflict_resolution_event.wait()
+
+    with conflict_lock:
+        res = conflict_resolution_result
+        pending_conflict_data = None
+        conflict_resolution_result = None
+    return res or {"decision": "abort", "apply_to_all": False}
+
+
+def abort_pending_conflict():
+    global pending_conflict_data, conflict_resolution_result
+    with conflict_lock:
+        if pending_conflict_data is not None:
+            conflict_resolution_result = {"decision": "abort", "apply_to_all": False}
+            pending_conflict_data = None
+            conflict_resolution_event.set()
+
 def hash_password(raw_password):
     if not raw_password:
         return ""
@@ -243,16 +273,17 @@ def win_long_path(path):
 
 
 def get_cached_file_handle(file_id, final_path, file_size):
-    """Return a cached r+b file handle for file_id (creating/truncating lazily on first chunk write). Caller must hold get_file_lock(file_id)."""
     fh = open_file_handles.get(file_id)
     if fh is not None and not fh.closed:
         return fh
     safe_p = win_long_path(final_path)
-    if not os.path.exists(safe_p):
+    needs_truncate = file_id in overwrite_truncate_pending
+    if not os.path.exists(safe_p) or needs_truncate:
         os.makedirs(os.path.dirname(safe_p), exist_ok=True)
         with open(safe_p, 'wb') as f_init:
             if file_size > 0:
                 f_init.truncate(file_size)
+        overwrite_truncate_pending.discard(file_id)
     fh = open(safe_p, 'r+b')
     open_file_handles[file_id] = fh
     return fh
@@ -298,6 +329,54 @@ def resolve_local_save_path(base_dir, rel_path):
         raise ValueError("Invalid relative path outside target directory")
     return full_path
 
+overwrite_truncate_pending = set()
+
+
+def get_unique_renamed_path(final_path, claimed_paths=None):
+    """Return a non-colliding path by appending _(1), _(2), ... before the extension."""
+    claimed = claimed_paths if claimed_paths is not None else set()
+    dir_name = os.path.dirname(final_path)
+    base_name = os.path.basename(final_path)
+    stem, ext = os.path.splitext(base_name)
+    counter = 1
+    while True:
+        candidate = os.path.join(dir_name, f"{stem}_({counter}){ext}")
+        norm_cand = os.path.normcase(os.path.abspath(candidate))
+        if not os.path.exists(win_long_path(candidate)) and norm_cand not in claimed:
+            return candidate
+        counter += 1
+
+
+def build_conflict_descriptor(session_token, direction, file_info, final_path, index, total, claimed_paths=None):
+    """Build full side-by-side comparison metadata for incoming vs. existing files."""
+    safe_existing = win_long_path(final_path)
+    ex_stat = os.stat(safe_existing)
+    renamed_preview = get_unique_renamed_path(final_path, claimed_paths)
+    return {
+        "conflict_id": secrets.token_hex(8),
+        "session_token": session_token,
+        "direction": direction,
+        "index": index,
+        "total": total,
+        "relative_path": normalize_rel_path(file_info["relative_path"]),
+        "filename": os.path.basename(final_path),
+        "renamed_preview_name": os.path.basename(renamed_preview),
+        "renamed_preview_path": renamed_preview,
+        "incoming": {
+            "name": os.path.basename(file_info["relative_path"]),
+            "source_path": file_info.get("source_path") or file_info["relative_path"],
+            "size": int(file_info.get("size", 0)),
+            "mtime": float(file_info.get("mtime", 0.0)),
+            "atime": float(file_info.get("atime", 0.0)),
+        },
+        "existing": {
+            "name": os.path.basename(final_path),
+            "save_path": final_path,
+            "size": int(ex_stat.st_size),
+            "mtime": float(ex_stat.st_mtime),
+            "atime": float(ex_stat.st_atime),
+        }
+    }
 
 def format_remote_save_path(remote_base_dir, rel_path, remote_os='linux'):
     """Format a display destination path for files pushed to the remote client."""
@@ -907,6 +986,7 @@ def perform_cancel(session_token=None, reason="User cancelled transfer"):
 
     direction = get_session_direction(session_token)
     print(f"[*] Executing Cancel ({reason}) for {direction.upper()} session {session_token}: removing only partial files...")
+    abort_pending_conflict()
     send_control_command({"action": "cancel_transfer", "session_token": session_token, "direction": direction})
     if session_token == current_active_token or not session_token:
         close_active_workers()
@@ -1238,7 +1318,7 @@ def start_push_session_on_server(session_token, paths, remote_dest_dir, is_resum
 
 
 def handle_push_manifest_processed(msg):
-    if msg.get("status") == "disk_full":
+    if msg.get("status") in ("disk_full", "cancelled"):
         tok = msg.get("session_token")
         print(f"[!] Client rejected PUSH ({tok}): {msg.get('message')}")
         with db_lock:
@@ -1688,6 +1768,59 @@ def process_pull_manifest_dict(manifest_payload, addr_ip):
     routed_srv_ip = (connected_client_info or {}).get("server_ip") or get_primary_local_ip()
 
     with db_lock:
+        sess_pre = history_conn.execute(
+            "SELECT destination_path FROM transfer_sessions WHERE session_token=?", (token,)
+        ).fetchone()
+        base_save_dir = sess_pre[0] if (sess_pre and sess_pre[0]) else SAVE_DIRECTORY
+        already_tracked_rels = {
+            r[0] for r in db_conn.execute(
+                "SELECT relative_path FROM files WHERE session_token=?", (token,)
+            ).fetchall()
+        }
+
+    # Pre-scan all conflicting files outside db_lock so /api/progress never deadlocks
+    conflicts_queue = []
+    for file_info in files:
+        norm_rel = normalize_rel_path(file_info["relative_path"])
+        if norm_rel in already_tracked_rels:
+            continue
+        final_path = resolve_local_save_path(base_save_dir, norm_rel)
+        if os.path.isfile(win_long_path(final_path)):
+            conflicts_queue.append((file_info, norm_rel, final_path))
+
+    resolution_map = {}
+    claimed_paths = set()
+    apply_all_decision = None
+    total_conflicts = len(conflicts_queue)
+
+    for idx, (file_info, norm_rel, final_path) in enumerate(conflicts_queue, start=1):
+        if apply_all_decision is None:
+            desc = build_conflict_descriptor(
+                token, "pull", file_info, final_path, idx, total_conflicts, claimed_paths
+            )
+            res = request_local_conflict_resolution(desc)
+            decision = res.get("decision", "abort")
+            if decision == "abort":
+                finalize_db_wal()
+                return {
+                    "action": "pull_manifest_processed",
+                    "status": "cancelled",
+                    "session_token": token,
+                    "message": "Transfer cancelled at file conflict prompt."
+                }
+            if res.get("apply_to_all"):
+                apply_all_decision = decision
+        else:
+            decision = apply_all_decision
+
+        if decision == "rename":
+            new_path = get_unique_renamed_path(final_path, claimed_paths)
+            claimed_paths.add(os.path.normcase(os.path.abspath(new_path)))
+            resolution_map[norm_rel] = {"action": "rename", "final_path": new_path}
+        else:
+            resolution_map[norm_rel] = {"action": decision, "final_path": final_path}
+
+    with db_lock:
         db_conn.execute("BEGIN IMMEDIATE")
         history_conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1786,6 +1919,28 @@ def process_pull_manifest_dict(manifest_payload, addr_ip):
                                 pass
                         existing = None
 
+                res_entry = resolution_map.get(norm_rel)
+                if res_entry and res_entry["action"] == "skip":
+                    history_conn.execute("""
+                        INSERT INTO transfer_history_files (
+                            session_token, file_id, relative_path, source_path, save_path, size,
+                            mtime, atime, pre_existed, status, transferred_at
+                        ) VALUES (?, 0, ?, ?, ?, ?, ?, ?, 1, 'skipped', ?)
+                        ON CONFLICT(session_token, relative_path) DO UPDATE SET
+                            status = 'skipped',
+                            transferred_at = excluded.transferred_at
+                    """, (
+                        token, norm_rel, src_full_path, final_path, file_info["size"],
+                        file_info["mtime"], file_info["atime"], now_ts
+                    ))
+                    already_completed_files.append(norm_rel)
+                    continue
+
+                is_overwrite = bool(res_entry and res_entry["action"] == "overwrite")
+                if res_entry and res_entry["action"] == "rename":
+                    final_path = res_entry["final_path"]
+                    safe_final_path = win_long_path(final_path)
+
                 if existing:
                     file_id = existing[0]
                     if existing[1]:
@@ -1793,13 +1948,14 @@ def process_pull_manifest_dict(manifest_payload, addr_ip):
                         safe_final_path = win_long_path(final_path)
                     pre_existed = existing[2]
                 else:
-                    pre_existed = 1 if (os.path.exists(safe_final_path) and os.path.getsize(safe_final_path) == file_info["size"]) else 0
+                    pre_existed = 1 if (is_overwrite or os.path.exists(safe_final_path)) else 0
                     cursor = db_conn.execute(
                         """INSERT INTO files (session_token, relative_path, source_path, save_path, size, mtime, atime, pre_existed)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                         (token, norm_rel, src_full_path, final_path, file_info["size"], file_info["mtime"], file_info["atime"], pre_existed)
                     )
                     file_id = cursor.lastrowid
+                    if is_overwrite and file_info["size"] > 0: overwrite_truncate_pending.add(file_id)
                     if file_info["size"] == 0:
                         db_conn.execute(
                             "INSERT INTO chunks (file_id, chunk_index, status) VALUES (?, 0, 'received')",
@@ -1814,7 +1970,7 @@ def process_pull_manifest_dict(manifest_payload, addr_ip):
                             )
 
                 # Only create 0-byte files upfront; non-empty files and their parent directories are created lazily on first chunk write!
-                if file_info["size"] == 0 and not os.path.exists(safe_final_path):
+                if file_info["size"] == 0 and (is_overwrite or not os.path.exists(safe_final_path)):
                     try:
                         os.makedirs(os.path.dirname(safe_final_path), exist_ok=True)
                         with open(safe_final_path, 'wb') as _:
@@ -1855,6 +2011,8 @@ def process_pull_manifest_dict(manifest_payload, addr_ip):
                     }
                     if not os.path.exists(safe_final_path):
                         required_missing_bytes += file_info["size"]
+                    elif is_overwrite:
+                        required_missing_bytes += max(0, file_info["size"] - os.path.getsize(safe_final_path))
                 else:
                     already_completed_files.append(norm_rel)
 
@@ -1986,7 +2144,7 @@ def spawn_server_outbound_workers(session_token, mode="pull"):
 
 def run_server_control_reader(conn, addr_ip):
     """Persistent reader loop for global_control_socket (resilient to malformed JSON lines)."""
-    global global_control_socket, connected_client_info, last_dir_result, current_active_token
+    global global_control_socket, connected_client_info, last_dir_result, current_active_token, pending_conflict_data
     buffer = bytearray()
     while server_running:
         try:
@@ -2031,10 +2189,15 @@ def run_server_control_reader(conn, addr_ip):
                         if tok:
                             sync_session_metrics(tok, override_status='interrupted')
                     finalize_db_wal()
+
+                elif m_act == "conflict_prompt":
+                    with conflict_lock:
+                        pending_conflict_data = msg.get("conflict")
         except Exception:
             break
 
     stop_push_workers()
+    abort_pending_conflict()
     with control_socket_lock:
         if global_control_socket is conn:
             global_control_socket = None
@@ -2315,6 +2478,7 @@ def api_connect_client():
 def api_disconnect_client():
     global global_control_socket, connected_client_info, last_dir_result
     send_control_command({"action": "disconnect_control"})
+    abort_pending_conflict()
     close_active_workers()
     with control_socket_lock:
         if global_control_socket:
@@ -2830,7 +2994,8 @@ def get_progress():
             "can_resume": can_resume,
             "can_cancel": can_cancel,
             "can_rollback": can_rollback,
-            "rollback_files_count": rollback_eligible_count
+            "rollback_files_count": rollback_eligible_count,
+            "pending_conflict": pending_conflict_data
         })
     except Exception as e:
         return jsonify({
@@ -2839,6 +3004,43 @@ def get_progress():
             "can_cancel": False, "can_rollback": False, "error": str(e)
         })
 
+@app.route('/api/conflict/resolve', methods=['POST'])
+def api_resolve_conflict():
+    global pending_conflict_data, conflict_resolution_result
+    data = request.json or {}
+    decision = (data.get("decision") or "").lower()
+    apply_to_all = bool(data.get("apply_to_all", False))
+    conflict_id = data.get("conflict_id")
+
+    if decision not in ("skip", "overwrite", "rename", "abort"):
+        return jsonify({"status": "error", "message": "Invalid decision."}), 400
+
+    with conflict_lock:
+        if not pending_conflict_data:
+            return jsonify({"status": "error", "message": "No pending conflict."}), 404
+        if conflict_id and pending_conflict_data.get("conflict_id") != conflict_id:
+            return jsonify({"status": "error", "message": "Conflict already resolved."}), 409
+
+        direction = pending_conflict_data.get("direction", "pull")
+        session_token = pending_conflict_data.get("session_token")
+        pending_conflict_data = None
+
+        if direction == "push":
+            send_control_command({
+                "action": "conflict_resolution",
+                "session_token": session_token,
+                "conflict_id": conflict_id,
+                "decision": decision,
+                "apply_to_all": apply_to_all
+            })
+        else:
+            conflict_resolution_result = {
+                "decision": decision,
+                "apply_to_all": apply_to_all
+            }
+            conflict_resolution_event.set()
+
+    return jsonify({"status": "success"})
 
 def start_web_server():
     app.run(
