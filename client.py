@@ -265,16 +265,17 @@ def win_long_path(path):
 
 
 def get_cached_file_handle(file_id, final_path, file_size):
-    """Return a cached r+b file handle for file_id (creating/truncating lazily on first chunk write). Caller must hold get_file_lock(file_id)."""
     fh = open_file_handles.get(file_id)
     if fh is not None and not fh.closed:
         return fh
     safe_p = win_long_path(final_path)
-    if not os.path.exists(safe_p):
+    needs_truncate = file_id in overwrite_truncate_pending
+    if not os.path.exists(safe_p) or needs_truncate:
         os.makedirs(os.path.dirname(safe_p), exist_ok=True)
         with open(safe_p, 'wb') as f_init:
             if file_size > 0:
                 f_init.truncate(file_size)
+        overwrite_truncate_pending.discard(file_id)
     fh = open(safe_p, 'r+b')
     open_file_handles[file_id] = fh
     return fh
@@ -319,6 +320,78 @@ def resolve_local_save_path(base_dir, rel_path):
         raise ValueError("Invalid relative path outside target directory")
     return full_path
 
+overwrite_truncate_pending = set()
+
+
+def get_unique_renamed_path(final_path, claimed_paths=None):
+    """Return a non-colliding path by appending _(1), _(2), ... before the extension."""
+    claimed = claimed_paths if claimed_paths is not None else set()
+    dir_name = os.path.dirname(final_path)
+    base_name = os.path.basename(final_path)
+    stem, ext = os.path.splitext(base_name)
+    counter = 1
+    while True:
+        candidate = os.path.join(dir_name, f"{stem}_({counter}){ext}")
+        norm_cand = os.path.normcase(os.path.abspath(candidate))
+        if not os.path.exists(win_long_path(candidate)) and norm_cand not in claimed:
+            return candidate
+        counter += 1
+
+client_conflict_lock = threading.Lock()
+client_conflict_result = None
+client_conflict_event = threading.Event()
+
+
+def request_remote_conflict_resolution(c_sock, conflict_descriptor):
+    global client_conflict_result
+    with client_conflict_lock:
+        client_conflict_result = None
+        client_conflict_event.clear()
+    try:
+        with control_send_lock:
+            c_sock.sendall((json.dumps({
+                "action": "conflict_prompt",
+                "conflict": conflict_descriptor
+            }) + "\n").encode('utf-8'))
+    except Exception:
+        return {"decision": "abort", "apply_to_all": False}
+
+    client_conflict_event.wait()
+    with client_conflict_lock:
+        res = client_conflict_result
+        client_conflict_result = None
+    return res or {"decision": "abort", "apply_to_all": False}
+
+def build_conflict_descriptor(session_token, direction, file_info, final_path, index, total, claimed_paths=None):
+    """Build full side-by-side comparison metadata for incoming vs. existing files."""
+    safe_existing = win_long_path(final_path)
+    ex_stat = os.stat(safe_existing)
+    renamed_preview = get_unique_renamed_path(final_path, claimed_paths)
+    return {
+        "conflict_id": secrets.token_hex(8),
+        "session_token": session_token,
+        "direction": direction,
+        "index": index,
+        "total": total,
+        "relative_path": normalize_rel_path(file_info["relative_path"]),
+        "filename": os.path.basename(final_path),
+        "renamed_preview_name": os.path.basename(renamed_preview),
+        "renamed_preview_path": renamed_preview,
+        "incoming": {
+            "name": os.path.basename(file_info["relative_path"]),
+            "source_path": file_info.get("source_path") or file_info["relative_path"],
+            "size": int(file_info.get("size", 0)),
+            "mtime": float(file_info.get("mtime", 0.0)),
+            "atime": float(file_info.get("atime", 0.0)),
+        },
+        "existing": {
+            "name": os.path.basename(final_path),
+            "save_path": final_path,
+            "size": int(ex_stat.st_size),
+            "mtime": float(ex_stat.st_mtime),
+            "atime": float(ex_stat.st_atime),
+        }
+    }
 
 def cleanup_empty_parent_dirs(file_path, base_dir):
     """Remove empty parent directories created during a PUSH transfer without deleting base_dir."""
@@ -1296,6 +1369,59 @@ def prepare_push_session_on_client(cmd, c_sock):
     required_missing_bytes = 0
 
     with db_lock:
+        already_tracked_rels = {
+            r[0] for r in state_conn.execute(
+                "SELECT relative_path FROM files WHERE session_token=?", (token,)
+            ).fetchall()
+        }
+
+    conflicts_queue = []
+    for finfo in files:
+        norm_rel = normalize_rel_path(finfo["relative_path"])
+        if norm_rel in already_tracked_rels:
+            continue
+        final_path = resolve_local_save_path(dest_dir, norm_rel)
+        if os.path.isfile(win_long_path(final_path)):
+            conflicts_queue.append((finfo, norm_rel, final_path))
+
+    resolution_map = {}
+    claimed_paths = set()
+    apply_all_decision = None
+    total_conflicts = len(conflicts_queue)
+
+    for idx, (finfo, norm_rel, final_path) in enumerate(conflicts_queue, start=1):
+        if apply_all_decision is None:
+            desc = build_conflict_descriptor(
+                token, "push", finfo, final_path, idx, total_conflicts, claimed_paths
+            )
+            res = request_remote_conflict_resolution(c_sock, desc)
+            decision = res.get("decision", "abort")
+            if decision == "abort":
+                finalize_db_wal()
+                try:
+                    with control_send_lock:
+                        c_sock.sendall((json.dumps({
+                            "action": "push_manifest_processed",
+                            "status": "cancelled",
+                            "session_token": token,
+                            "message": "Transfer cancelled at file conflict prompt."
+                        }) + "\n").encode('utf-8'))
+                except Exception:
+                    pass
+                return
+            if res.get("apply_to_all"):
+                apply_all_decision = decision
+        else:
+            decision = apply_all_decision
+
+        if decision == "rename":
+            new_path = get_unique_renamed_path(final_path, claimed_paths)
+            claimed_paths.add(os.path.normcase(os.path.abspath(new_path)))
+            resolution_map[norm_rel] = {"action": "rename", "final_path": new_path}
+        else:
+            resolution_map[norm_rel] = {"action": decision, "final_path": final_path}
+
+    with db_lock:
         state_conn.execute("BEGIN IMMEDIATE")
         history_conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1378,6 +1504,29 @@ def prepare_push_session_on_client(cmd, c_sock):
                                 pass
                         existing = None
 
+                res_entry = resolution_map.get(norm_rel)
+                if res_entry and res_entry["action"] == "skip":
+                    pre_existed_map[norm_rel] = 1
+                    history_conn.execute("""
+                        INSERT INTO transfer_history_files (
+                            session_token, file_id, relative_path, source_path, save_path, size,
+                            mtime, atime, pre_existed, status, transferred_at
+                        ) VALUES (?, 0, ?, ?, ?, ?, ?, ?, 1, 'skipped', ?)
+                        ON CONFLICT(session_token, relative_path) DO UPDATE SET
+                            status = 'skipped',
+                            transferred_at = excluded.transferred_at
+                    """, (
+                        token, norm_rel, src_full_path, final_path, finfo["size"],
+                        finfo["mtime"], finfo["atime"], now_ts
+                    ))
+                    already_completed.append(norm_rel)
+                    continue
+
+                is_overwrite = bool(res_entry and res_entry["action"] == "overwrite")
+                if res_entry and res_entry["action"] == "rename":
+                    final_path = res_entry["final_path"]
+                    safe_final_path = win_long_path(final_path)
+
                 if existing:
                     file_id = existing[0]
                     if existing[1]:
@@ -1385,13 +1534,15 @@ def prepare_push_session_on_client(cmd, c_sock):
                         safe_final_path = win_long_path(final_path)
                     pre_existed = existing[2]
                 else:
-                    pre_existed = 1 if (os.path.exists(safe_final_path) and os.path.getsize(safe_final_path) == finfo["size"]) else 0
+                    pre_existed = 1 if (is_overwrite or os.path.exists(safe_final_path)) else 0
                     cur = state_conn.execute(
                         """INSERT INTO files (session_token, relative_path, source_path, save_path, size, mtime, atime, pre_existed)
                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                         (token, norm_rel, src_full_path, final_path, finfo["size"], finfo["mtime"], finfo["atime"], pre_existed)
                     )
                     file_id = cur.lastrowid
+                    if is_overwrite and finfo["size"] > 0:
+                        overwrite_truncate_pending.add(file_id)
                     if finfo["size"] == 0:
                         state_conn.execute(
                             "INSERT INTO chunks (file_id, chunk_index, status) VALUES (?, 0, 'received')",
@@ -1408,7 +1559,7 @@ def prepare_push_session_on_client(cmd, c_sock):
                 pre_existed_map[norm_rel] = pre_existed
 
                 # Remark #1: Only create 0-byte files upfront; non-empty files are created lazily on first chunk write!
-                if finfo["size"] == 0 and not os.path.exists(safe_final_path):
+                if finfo["size"] == 0 and (is_overwrite or not os.path.exists(safe_final_path)):
                     try:
                         os.makedirs(os.path.dirname(safe_final_path), exist_ok=True)
                         with open(safe_final_path, 'wb') as _:
@@ -1451,6 +1602,8 @@ def prepare_push_session_on_client(cmd, c_sock):
                     }
                     if not os.path.exists(safe_final_path):
                         required_missing_bytes += finfo["size"]
+                    elif is_overwrite:
+                        required_missing_bytes += max(0, finfo["size"] - os.path.getsize(safe_final_path))
                 else:
                     already_completed.append(norm_rel)
 
@@ -2217,6 +2370,7 @@ def run_control_session(server_ip, server_port):
     """Connect (or reuse the upgraded invite socket) and maintain the authenticated control channel."""
     global is_connected_to_server, active_server_hostname, active_server_os, active_server_ip
     global master_session_token, upgraded_control_socket, active_control_socket, last_pull_manifest_response
+    global client_conflict_result
 
     c_sock = None
     with upgraded_control_lock:
@@ -2307,6 +2461,14 @@ def run_control_session(server_ip, server_port):
                     last_pull_manifest_response = cmd
                     pull_manifest_event.set()
 
+                elif action == "conflict_resolution":
+                    with client_conflict_lock:
+                        client_conflict_result = {
+                            "decision": cmd.get("decision", "abort"),
+                            "apply_to_all": bool(cmd.get("apply_to_all", False))
+                        }
+                        client_conflict_event.set()
+
                 elif action == "start_transfer":
                     paths = cmd.get("paths", [])
                     req_tok = cmd.get("session_token")
@@ -2343,6 +2505,7 @@ def run_control_session(server_ip, server_port):
                 elif action in ("cancel_transfer", "stop_transfer", "pause_transfer", "rollback_transfer"):
                     stop_local_workers()
                     pull_manifest_event.set()
+                    client_conflict_event.set()
                     update_client_session_state_on_action(
                         cmd.get("session_token"),
                         action,
@@ -2360,6 +2523,7 @@ def run_control_session(server_ip, server_port):
     finally:
         stop_local_workers()
         pull_manifest_event.set()
+        client_conflict_event.set()
         if active_control_socket is c_sock:
             active_control_socket = None
         is_connected_to_server = False
