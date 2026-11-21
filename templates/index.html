@@ -2,7 +2,8 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0d1117">
     <title>Core Engine UI — Efficient File Transfer v3.1 (Two-Way)</title>
     <style>
         :root {
@@ -26,20 +27,30 @@
             --warning: #d29922;
             --danger: #f85149;
             --purple: #a371f7;
+            --safe-bottom: env(safe-area-inset-bottom, 0px);
+            --safe-top: env(safe-area-inset-top, 0px);
         }
 
-        * { box-sizing: border-box; }
-        body {
-            margin: 0; padding: 0;
+        * {
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent;
+        }
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            max-width: 100%;
+            height: 100vh;
+            height: 100dvh;
+            overflow: hidden;
             background-color: var(--bg-app);
             color: var(--text-main);
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Inter, sans-serif;
             font-size: 13px;
-            display: flex;
-            height: 100vh;
-            width: 100vw;
-            overflow: hidden;
             -webkit-font-smoothing: antialiased;
+        }
+        body {
+            display: flex;
         }
 
         /* --- CUSTOM SCROLLBARS --- */
@@ -48,7 +59,7 @@
         ::-webkit-scrollbar-thumb { background: #303746; border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: #434c5e; }
 
-        /* --- SIDEBAR --- */
+        /* --- SIDEBAR (Desktop left rail / Mobile full-screen History view) --- */
         .sidebar {
             width: 285px;
             min-width: 285px;
@@ -116,6 +127,7 @@
         .history-list {
             flex-grow: 1;
             overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
             padding: 4px 10px 12px 10px;
             display: flex;
             flex-direction: column;
@@ -153,6 +165,7 @@
             overflow: hidden;
             text-overflow: ellipsis;
             color: var(--text-main);
+            min-width: 0;
         }
         .history-peers {
             font-size: 10.5px;
@@ -168,19 +181,20 @@
             align-items: center;
             font-size: 11px;
             color: var(--text-muted);
+            gap: 6px;
         }
         .mini-resume-btn {
             margin-top: 2px;
-            padding: 4px 8px;
-            font-size: 11px;
-            border-radius: 5px;
+            padding: 5px 8px;
+            font-size: 11.5px;
+            border-radius: 6px;
             background-color: rgba(63, 185, 80, 0.16);
             color: #7ee787;
             border: 1px solid rgba(63, 185, 80, 0.4);
             cursor: pointer;
             font-weight: 600;
             width: 100%;
-            text-align: center;
+            justify-content: center;
         }
         .mini-resume-btn:hover { background-color: rgba(63, 185, 80, 0.28); color: #fff; }
 
@@ -201,12 +215,13 @@
         .badge-cancelled { background: rgba(139, 148, 158, 0.18); color: #b1bac4; border: 1px solid rgba(139, 148, 158, 0.4); }
         .badge-rolled_back { background: rgba(248, 81, 73, 0.22); color: #ff7b72; border: 1px solid rgba(248, 81, 73, 0.5); }
         .badge-pending { background: rgba(210, 153, 34, 0.15); color: #e3b341; border: 1px solid rgba(210, 153, 34, 0.4); }
+        .badge-skipped { background: rgba(139, 148, 158, 0.22); color: #c9d1d9; border: 1px solid rgba(139, 148, 158, 0.45); }
         .badge-pull { background: rgba(47, 129, 247, 0.16); color: #79c0ff; border: 1px solid rgba(47, 129, 247, 0.4); font-size: 9.5px; padding: 1px 5px; border-radius: 4px; font-weight: 700; }
         .badge-push { background: rgba(163, 113, 247, 0.18); color: #d2a8ff; border: 1px solid rgba(163, 113, 247, 0.45); font-size: 9.5px; padding: 1px 5px; border-radius: 4px; font-weight: 700; }
         .badge-locked { background: rgba(210, 153, 34, 0.18); color: #e3b341; border: 1px solid rgba(210, 153, 34, 0.45); font-size: 10.5px; padding: 2px 7px; border-radius: 4px; font-weight: 600; }
         .badge-open { background: rgba(63, 185, 80, 0.15); color: #7ee787; border: 1px solid rgba(63, 185, 80, 0.4); font-size: 10.5px; padding: 2px 7px; border-radius: 4px; font-weight: 600; }
 
-        /* --- MAIN AREA & NON-CLIPPING TOP COMMAND BAR --- */
+        /* --- MAIN AREA & TOP COMMAND BAR --- */
         .main-area {
             flex-grow: 1;
             min-width: 0;
@@ -251,6 +266,62 @@
             margin-left: 4px;
         }
 
+        /* Mobile-only header (hidden on desktop) */
+        .mobile-topbar {
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: calc(8px + var(--safe-top)) 12px 8px 12px;
+            background-color: var(--pane-header);
+            border-bottom: 1px solid var(--border-color);
+            flex-shrink: 0;
+        }
+        .mobile-brand {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-weight: 700;
+            font-size: 14px;
+            color: #fff;
+            min-width: 0;
+            white-space: nowrap;
+        }
+        .mobile-topbar-right {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            min-width: 0;
+        }
+        .mobile-peer-chip {
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 600;
+            border: 1px solid var(--border-color);
+            background: var(--input-bg);
+            color: var(--text-main);
+            max-width: 190px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            cursor: pointer;
+            min-height: 34px;
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+        }
+        .mobile-peer-chip.online {
+            color: #7ee787;
+            border-color: rgba(63, 185, 80, 0.5);
+            background: rgba(63, 185, 80, 0.12);
+        }
+        .mobile-peer-chip.offline {
+            color: #ffa198;
+            border-color: rgba(248, 81, 73, 0.5);
+            background: rgba(248, 81, 73, 0.12);
+        }
+
         button {
             background-color: var(--card-bg);
             color: var(--text-main);
@@ -268,6 +339,11 @@
             gap: 5px;
         }
         button:hover { background-color: #293242; border-color: #3d4758; color: #ffffff; }
+        button:active { transform: scale(0.98); }
+        button:focus-visible, input:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 1px;
+        }
         .action-btn { display: none; font-weight: 600; }
         .btn-copy {
             background: linear-gradient(180deg, #2f81f7 0%, #1f6feb 100%);
@@ -361,6 +437,7 @@
             overflow: hidden;
             text-overflow: ellipsis;
             color: #fff;
+            min-width: 0;
         }
         .os-badge {
             font-size: 10px;
@@ -386,7 +463,7 @@
         }
         .address-bar input.path-input {
             flex: 1 1 auto;
-            min-width: 100px;
+            min-width: 80px;
             background: var(--input-bg);
             border: 1px solid var(--border-color);
             color: var(--text-main);
@@ -410,6 +487,30 @@
         }
         .address-bar input:focus { border-color: var(--accent); }
         .nav-btn { padding: 5px 9px; font-weight: 700; min-width: 30px; justify-content: center; }
+        .mobile-filter-toggle { display: none; }
+
+        /* Mobile-only destination indicator banner */
+        .mobile-dest-hint {
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 5px 10px;
+            background: rgba(47, 129, 247, 0.08);
+            border-bottom: 1px solid var(--border-subtle);
+            font-size: 11.5px;
+            color: var(--text-secondary);
+            flex-shrink: 0;
+        }
+        .mobile-dest-hint-path {
+            font-family: 'Cascadia Code', Consolas, monospace;
+            color: #79c0ff;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            min-width: 0;
+            flex: 1;
+        }
 
         /* --- CLICKABLE BREADCRUMB STRIP --- */
         .breadcrumb-bar {
@@ -420,6 +521,7 @@
             background-color: rgba(15, 19, 26, 0.6);
             border-bottom: 1px solid var(--border-color);
             overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
             white-space: nowrap;
             font-size: 11.5px;
             min-height: 27px;
@@ -454,6 +556,7 @@
         .tree-view {
             padding: 4px 6px;
             overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
             flex-grow: 1;
             min-height: 0;
         }
@@ -486,13 +589,31 @@
             text-overflow: ellipsis;
             gap: 6px;
             padding-right: 8px;
+            min-width: 0;
+        }
+        .item-text-wrap {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            overflow: hidden;
+            flex: 1;
         }
         .item-label {
             overflow: hidden;
             text-overflow: ellipsis;
+            white-space: nowrap;
             font-weight: 500;
         }
         .item-label.is-folder { color: #f0f6fc; font-weight: 600; }
+        .item-submeta {
+            display: none;
+            font-size: 11px;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-top: 2px;
+        }
         .item-date { color: var(--text-secondary); white-space: nowrap; font-size: 11.5px; }
         .item-size {
             color: var(--text-secondary);
@@ -581,8 +702,8 @@
             gap: 12px;
             flex-wrap: wrap;
         }
-        .session-title-group h2 { margin: 0 0 4px 0; font-size: 16px; color: #fff; }
-        .session-sub { font-size: 11.5px; color: var(--text-secondary); font-family: 'Cascadia Code', Consolas, monospace; }
+        .session-title-group h2 { margin: 0 0 4px 0; font-size: 16px; color: #fff; word-break: break-word; }
+        .session-sub { font-size: 11.5px; color: var(--text-secondary); font-family: 'Cascadia Code', Consolas, monospace; word-break: break-all; }
         .session-actions-group { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
         .session-meta-grid {
             display: grid;
@@ -622,7 +743,12 @@
             text-transform: uppercase;
             flex-shrink: 0;
         }
-        .files-table-body { overflow-y: auto; flex-grow: 1; min-height: 0; }
+        .files-table-body {
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            flex-grow: 1;
+            min-height: 0;
+        }
         .files-table-row {
             display: grid;
             grid-template-columns: 2.4fr 95px 95px 105px 165px;
@@ -639,9 +765,11 @@
             font-size: 11px;
             color: #79c0ff;
             background: rgba(47, 129, 247, 0.12);
-            padding: 1px 6px;
+            padding: 2px 6px;
             border-radius: 4px;
             border: 1px solid rgba(47, 129, 247, 0.28);
+            word-break: break-all;
+            white-space: normal;
         }
 
         /* --- PROGRESS BOX --- */
@@ -667,10 +795,85 @@
             width: 0%;
             transition: width 0.25s ease;
         }
-        .progress-stats { font-size: 12px; color: var(--text-secondary); display: flex; justify-content: space-between; font-weight: 600; }
-        .active-files-list { font-size: 11px; color: var(--text-secondary); margin-top: 5px; font-family: 'Cascadia Code', Consolas, monospace; }
+        .progress-stats { font-size: 12px; color: var(--text-secondary); display: flex; justify-content: space-between; font-weight: 600; gap: 8px; }
+        .active-files-list { font-size: 11px; color: var(--text-secondary); margin-top: 5px; font-family: 'Cascadia Code', Consolas, monospace; word-break: break-all; }
 
-        /* --- WELCOME & CLIENT CONNECTION MODAL --- */
+        /* --- MOBILE THUMB-ZONE ACTION DOCK & BOTTOM NAVIGATION (Hidden on desktop) --- */
+        .mobile-action-dock {
+            display: none;
+            flex-direction: column;
+            gap: 8px;
+            padding: 10px 12px;
+            background: var(--pane-header);
+            border-top: 1px solid var(--accent);
+            box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.45);
+            flex-shrink: 0;
+        }
+        .mobile-action-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .mobile-action-row button {
+            flex: 1 1 auto;
+            justify-content: center;
+            min-height: 44px;
+            font-size: 13.5px;
+            font-weight: 600;
+            border-radius: 8px;
+            padding: 8px 12px;
+        }
+        .mobile-bottom-nav {
+            display: none;
+            grid-template-columns: repeat(4, 1fr);
+            background: var(--sidebar-bg);
+            border-top: 1px solid var(--border-color);
+            padding: 6px 4px calc(6px + var(--safe-bottom)) 4px;
+            flex-shrink: 0;
+            z-index: 400;
+        }
+        .mobile-nav-item {
+            background: transparent;
+            border: none;
+            border-radius: 8px;
+            color: var(--text-secondary);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 3px;
+            padding: 6px 4px;
+            min-height: 50px;
+            font-size: 11px;
+            font-weight: 600;
+            position: relative;
+        }
+        .mobile-nav-item:hover { background: var(--hover-row); color: var(--text-main); }
+        .mobile-nav-item.active {
+            color: #79c0ff;
+            background: var(--accent-soft);
+        }
+        .mobile-nav-icon { font-size: 18px; line-height: 1; }
+        .mobile-nav-badge {
+            position: absolute;
+            top: 4px;
+            right: calc(50% - 24px);
+            background: var(--accent);
+            color: #fff;
+            font-size: 10px;
+            font-weight: 700;
+            min-width: 17px;
+            height: 17px;
+            padding: 0 4px;
+            border-radius: 999px;
+            display: none;
+            align-items: center;
+            justify-content: center;
+        }
+        .mobile-nav-badge.push-badge { background: var(--purple); }
+        .mobile-nav-badge.visible { display: inline-flex; }
+
+        /* --- MODALS (Client Discovery & Conflict Resolution) --- */
         .connect-overlay {
             position: fixed;
             inset: 0;
@@ -692,24 +895,29 @@
             overflow: hidden;
             display: flex;
             flex-direction: column;
+            max-height: 90vh;
+            max-height: 90dvh;
         }
         .connect-card-header {
-            padding: 18px 22px;
+            padding: 16px 20px;
             background: linear-gradient(135deg, #1b2536 0%, #151b26 100%);
             border-bottom: 1px solid var(--border-color);
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 10px;
+            flex-shrink: 0;
         }
-        .connect-card-header h1 { margin: 0; font-size: 17px; color: #fff; }
+        .connect-card-header h1 { margin: 0; font-size: 16.5px; color: #fff; }
         .connect-card-header p { margin: 4px 0 0 0; font-size: 12px; color: var(--text-secondary); }
         .connect-card-body {
-            padding: 18px 22px;
+            padding: 16px 20px;
             display: flex;
             flex-direction: column;
             gap: 14px;
-            max-height: 78vh;
             overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            flex: 1 1 auto;
         }
         .server-info-banner {
             display: flex;
@@ -737,7 +945,7 @@
             flex-wrap: wrap;
         }
         .waiting-client-row:hover { border-color: var(--accent); background-color: #242d3d; }
-        .client-meta-main { display: flex; align-items: center; gap: 12px; }
+        .client-meta-main { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1 1 220px; }
         .client-device-icon {
             width: 40px;
             height: 40px;
@@ -748,6 +956,7 @@
             align-items: center;
             justify-content: center;
             font-size: 20px;
+            flex-shrink: 0;
         }
 
         /* --- PASSWORD PROMPT BOX --- */
@@ -764,6 +973,7 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 8px;
             font-weight: 600;
             color: #e3b341;
             font-size: 13px;
@@ -776,6 +986,7 @@
         }
         .password-auth-controls input {
             flex-grow: 1;
+            min-width: 140px;
             background: var(--input-bg);
             border: 1px solid var(--border-color);
             color: var(--text-main);
@@ -797,7 +1008,7 @@
         }
         .manual-connect-row input {
             flex-grow: 1;
-            min-width: 180px;
+            min-width: 160px;
             background: var(--input-bg);
             border: 1px solid var(--border-color);
             color: var(--text-main);
@@ -816,18 +1027,406 @@
             padding: 7px 14px;
         }
         .btn-primary-connect:hover { background: var(--accent-hover); }
-        .error-msg { color: #ff7b72; padding: 10px; font-size: 12px; }
+        .error-msg { color: #ff7b72; padding: 12px; font-size: 12.5px; }
         .empty-state-box {
-            padding: 24px 16px;
+            padding: 28px 16px;
             text-align: center;
             color: var(--text-secondary);
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        /* --- FILE CONFLICT MODAL --- */
+        .conflict-compare-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        .conflict-file-card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 12px 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .conflict-card-title {
+            font-weight: 700;
             font-size: 12.5px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 6px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+        .conflict-field { display: flex; flex-direction: column; gap: 2px; }
+        .conflict-field-label { font-size: 10.5px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.4px; }
+        .conflict-field-val { font-size: 12px; color: var(--text-main); font-family: 'Cascadia Code', Consolas, monospace; word-break: break-all; }
+        .conflict-diff-bar {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            padding: 8px 12px;
+            background: rgba(210, 153, 34, 0.08);
+            border: 1px solid rgba(210, 153, 34, 0.35);
+            border-radius: 6px;
+            font-size: 12px;
+            color: #e3b341;
+        }
+        .conflict-footer {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        /* =====================================================================
+           PHONE-FIRST RESPONSIVE REDESIGN (<= 900px)
+           Dedicated mobile app chrome: compact top header, full-screen single
+           view (Remote / Local / History / Detail), thumb-zone transfer dock,
+           bottom tab navigation, 48px touch rows, and bottom-sheet modals.
+           ===================================================================== */
+        @media (max-width: 900px) {
+            body {
+                flex-direction: column;
+                font-size: 14px;
+            }
+
+            /* Hide desktop top toolbar; show mobile header + bottom nav */
+            .toolbar { display: none !important; }
+            .mobile-topbar { display: flex; }
+            .mobile-bottom-nav { display: grid; }
+
+            /* Sidebar becomes the full-screen History tab view on mobile */
+            .sidebar,
+            .sidebar.collapsed {
+                width: 100%;
+                min-width: 0;
+                max-width: none;
+                border-right: none;
+                flex: 1 1 auto;
+                min-height: 0;
+                display: none;
+                transition: none;
+            }
+            .sidebar.mobile-view-active {
+                display: flex;
+            }
+            .sidebar-header {
+                display: none;
+            }
+            .sidebar-section-label {
+                padding: 12px 14px 8px 14px;
+                font-size: 11.5px;
+                background: var(--pane-header);
+                border-bottom: 1px solid var(--border-color);
+            }
+            .history-list {
+                padding: 10px 10px 16px 10px;
+                gap: 8px;
+            }
+            .history-item {
+                padding: 12px 14px;
+                border-radius: 10px;
+                gap: 6px;
+                background: var(--pane-bg);
+            }
+            .history-title { font-size: 14px; }
+            .history-peers { font-size: 11.5px; }
+            .history-meta { font-size: 12px; }
+            .mini-resume-btn {
+                min-height: 40px;
+                font-size: 13px;
+                margin-top: 4px;
+            }
+
+            /* Main area fills all space between top bar and bottom nav */
+            .main-area {
+                padding: 0;
+                gap: 0;
+                flex: 1 1 auto;
+                min-height: 0;
+            }
+            .main-area.mobile-hidden {
+                display: none !important;
+            }
+
+            /* Single-pane full-bleed file browser */
+            .workspace {
+                grid-template-columns: 1fr;
+                gap: 0;
+            }
+            .panel {
+                border: none;
+                border-radius: 0;
+                display: none;
+            }
+            .panel.mobile-active {
+                display: flex;
+            }
+            .panel-title {
+                padding: 10px 12px;
+                font-size: 13.5px;
+            }
+
+            /* Touch-friendly address bar with collapsible filter */
+            .address-bar {
+                padding: 8px 10px;
+                gap: 6px;
+                flex-wrap: wrap;
+            }
+            .nav-btn {
+                min-width: 42px;
+                min-height: 42px;
+                padding: 0 10px;
+                font-size: 16px;
+                border-radius: 8px;
+            }
+            .address-bar input.path-input {
+                min-height: 42px;
+                font-size: 15px;
+                padding: 8px 10px;
+                border-radius: 8px;
+            }
+            .mobile-filter-toggle {
+                display: inline-flex;
+            }
+            .address-bar input.filter-input {
+                display: none;
+                width: 100%;
+                flex: 1 1 100%;
+                min-height: 42px;
+                font-size: 16px;
+                padding: 8px 12px;
+                border-radius: 8px;
+                margin-top: 2px;
+            }
+            .address-bar.filter-open input.filter-input {
+                display: block;
+            }
+
+            .mobile-dest-hint {
+                display: flex;
+            }
+
+            .breadcrumb-bar {
+                padding: 6px 10px;
+                min-height: 36px;
+                font-size: 12.5px;
+            }
+            .crumb-item {
+                padding: 4px 8px;
+            }
+
+            /* Spacious 2-line file rows with 44px checkbox touch target */
+            .list-header {
+                grid-template-columns: 1fr 48px;
+                padding: 8px 12px;
+                font-size: 11.5px;
+            }
+            .list-header > span:nth-child(2),
+            .list-header > span:nth-child(3) {
+                display: none;
+            }
+            .tree-view {
+                padding: 4px 6px 12px 6px;
+            }
+            .tree-item-container {
+                grid-template-columns: 1fr 48px;
+                padding: 10px 6px 10px 10px;
+                min-height: 56px;
+                border-radius: 10px;
+                margin-bottom: 3px;
+            }
+            .expander { display: none; }
+            .file-badge-icon { font-size: 22px; margin-right: 4px; }
+            .item-label { font-size: 14.5px; }
+            .item-submeta { display: block; }
+            .item-date, .item-size { display: none; }
+            .item-checkbox {
+                width: 48px;
+                height: 44px;
+                justify-content: center;
+                padding-right: 0;
+            }
+            input[type="checkbox"] {
+                width: 22px;
+                height: 22px;
+            }
+            .panel-footer {
+                padding: 8px 12px;
+                font-size: 11.5px;
+            }
+            #local-footer-dest { display: none; }
+
+            /* Progress bar styled cleanly above dock */
+            .progress-container {
+                border-radius: 0;
+                border-left: none;
+                border-right: none;
+                border-bottom: none;
+                padding: 10px 12px;
+            }
+
+            /* Session detail view full-screen scrollable */
+            .session-detail-view {
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
+                padding: 10px;
+                gap: 10px;
+            }
+            .session-summary-card {
+                padding: 14px;
+            }
+            .session-actions-group {
+                width: 100%;
+            }
+            .session-actions-group button {
+                flex: 1 1 auto;
+                min-height: 42px;
+                justify-content: center;
+                font-size: 13px;
+            }
+            .session-meta-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+            .session-files-panel {
+                flex-grow: 0;
+                min-height: 360px;
+                overflow: visible;
+            }
+            .files-table-header { display: none; }
+            .files-table-row {
+                display: flex;
+                flex-direction: column;
+                align-items: stretch;
+                gap: 6px;
+                padding: 12px;
+            }
+            #sd-files-search {
+                width: 100% !important;
+                min-height: 40px;
+                font-size: 15px !important;
+            }
+
+            /* Bottom-sheet style modals for phone ergonomics */
+            .connect-overlay {
+                padding: 0;
+                align-items: flex-end;
+            }
+            .connect-card {
+                max-width: 100%;
+                max-height: 92dvh;
+                border-radius: 16px 16px 0 0;
+                border-left: none;
+                border-right: none;
+                border-bottom: none;
+            }
+            .connect-card-header {
+                padding: 14px 16px;
+            }
+            .connect-card-header h1 { font-size: 15.5px; }
+            .connect-card-header button {
+                min-height: 38px;
+                padding: 6px 12px;
+            }
+            .connect-card-body {
+                padding: 14px 16px calc(18px + var(--safe-bottom)) 16px;
+                gap: 12px;
+            }
+            .waiting-client-row {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 10px;
+            }
+            .waiting-client-row button {
+                min-height: 44px;
+                width: 100%;
+                justify-content: center;
+                font-size: 13.5px;
+            }
+            .password-auth-controls input,
+            .manual-connect-row input {
+                font-size: 16px;
+                min-height: 44px;
+                width: 100%;
+                max-width: 100% !important;
+            }
+            .password-auth-controls button,
+            .manual-connect-row button {
+                min-height: 44px;
+                flex: 1 1 auto;
+                justify-content: center;
+                font-size: 13.5px;
+            }
+
+            /* Conflict comparison modal stacked cleanly */
+            .conflict-compare-grid {
+                grid-template-columns: 1fr;
+            }
+            .conflict-footer {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 12px;
+            }
+            .conflict-footer label {
+                padding: 10px 12px;
+                background: var(--card-bg);
+                border: 1px solid var(--border-color);
+                border-radius: 8px;
+                min-height: 44px;
+            }
+            .conflict-actions-row {
+                display: grid !important;
+                grid-template-columns: 1fr 1fr;
+                gap: 8px !important;
+            }
+            .conflict-actions-row button {
+                min-height: 46px;
+                justify-content: center;
+                font-size: 13.5px;
+                white-space: normal;
+                text-align: center;
+            }
+            #btn-conflict-rename {
+                grid-column: 1 / -1;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .session-meta-grid {
+                grid-template-columns: 1fr;
+            }
+            .mobile-peer-chip {
+                max-width: 155px;
+                font-size: 11.5px;
+            }
         }
     </style>
 </head>
 <body>
 
-    <!-- LEFT SIDEBAR -->
+    <!-- MOBILE TOP HEADER (Shown only <= 900px) -->
+    <header class="mobile-topbar" id="mobile-topbar">
+        <div class="mobile-brand">
+            <span>⚡ EFT</span>
+            <span class="brand-badge">v3.1</span>
+            <span id="mobile-state-badge" class="badge badge-cancelled" style="margin-left:2px;">IDLE</span>
+        </div>
+        <div class="mobile-topbar-right">
+            <button id="mobile-peer-chip" class="mobile-peer-chip offline"
+                onclick="openConnectOverlay(true)"
+                aria-label="Connect or switch client">
+                🔴 Offline
+            </button>
+        </div>
+    </header>
+
+    <!-- LEFT SIDEBAR (Desktop sidebar / Mobile full-screen History tab) -->
     <aside class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <div class="brand-row">
@@ -850,8 +1449,8 @@
     </aside>
 
     <!-- MAIN CONTENT -->
-    <main class="main-area">
-        <!-- SINGLE-LINE NON-CLIPPING TOOLBAR -->
+    <main class="main-area" id="main-area">
+        <!-- DESKTOP TOP COMMAND BAR (Hidden on mobile) -->
         <div class="toolbar">
             <div class="toolbar-left">
                 <button onclick="toggleSidebar()" title="Toggle Transfer History Sidebar">☰ History</button>
@@ -908,33 +1507,40 @@
             </div>
         </div>
 
-        <!-- VIEW 1: DUAL-PANE TWO-WAY FILE BROWSER -->
+        <!-- VIEW 1: DUAL-PANE (Desktop) / TABBED SINGLE-PANE (Mobile) FILE BROWSER -->
         <div class="workspace" id="new-transfer-view">
             <!-- Remote Client Panel (Source for PULL / Destination for PUSH) -->
-            <div class="panel">
+            <div class="panel mobile-active" id="remote-panel">
                 <div class="panel-title">
                     <span class="panel-title-text" id="remote-panel-label">📱 Remote Client Device (Not Connected)</span>
                     <span class="os-badge" id="remote-os-badge">REMOTE</span>
                 </div>
-                <div class="address-bar">
-                    <button class="nav-btn" onclick="navigateUp('remote')" title="Up to parent directory">↑</button>
+                <div class="address-bar" id="remote-address-bar">
+                    <button class="nav-btn" onclick="navigateUp('remote')" title="Up to parent directory" aria-label="Remote parent folder">↑</button>
                     <input type="text" class="path-input" id="remote-path-input" value=""
                         placeholder="Connect a client to browse remote path..."
                         onkeydown="handleAddressKey(event, 'remote')">
-                    <button class="nav-btn" onclick="navigateToInput('remote')" title="Go to path">→</button>
-                    <button class="nav-btn" onclick="navigateToInput('remote')" title="Refresh directory">↻</button>
+                    <button class="nav-btn" onclick="navigateToInput('remote')" title="Go to path" aria-label="Go to remote path">→</button>
+                    <button class="nav-btn" onclick="navigateToInput('remote')" title="Refresh directory" aria-label="Refresh remote folder">↻</button>
+                    <button class="nav-btn mobile-filter-toggle" onclick="toggleMobileFilter('remote')" title="Search files" aria-label="Filter remote files">🔍</button>
                     <input type="text" class="filter-input" id="remote-filter-input"
                         placeholder="🔍 Filter files..."
                         oninput="filterTreeItems('remote', this.value)"
                         title="Quickly filter items in the remote view">
+                </div>
+                <div class="mobile-dest-hint" id="remote-dest-hint">
+                    <span>Pull saves to:</span>
+                    <span class="mobile-dest-hint-path" id="remote-dest-hint-path">—</span>
+                    <button onclick="setMobileTab('local')" style="padding:3px 8px; font-size:11px;">Change</button>
                 </div>
                 <div class="breadcrumb-bar" id="remote-breadcrumbs"></div>
                 <div class="list-header">
                     <span>Name</span>
                     <span>Modified</span>
                     <span>Size</span>
-                    <span style="text-align:right; padding-right:4px;">
+                    <span style="text-align:center;">
                         <input type="checkbox" id="remote-select-all"
+                            aria-label="Select all remote items"
                             title="Select or unselect all visible items in Remote panel for PULL transfer"
                             onchange="toggleSelectAll('remote', this.checked)">
                     </span>
@@ -947,30 +1553,37 @@
             </div>
 
             <!-- Local Server Panel (Destination for PULL / Source for PUSH) -->
-            <div class="panel">
+            <div class="panel" id="local-panel">
                 <div class="panel-title">
                     <span class="panel-title-text" id="local-panel-label">💻 Local Host Server</span>
                     <span class="os-badge" id="local-os-badge">LOCAL</span>
                 </div>
-                <div class="address-bar">
-                    <button class="nav-btn" onclick="navigateUp('local')" title="Up to parent directory">↑</button>
+                <div class="address-bar" id="local-address-bar">
+                    <button class="nav-btn" onclick="navigateUp('local')" title="Up to parent directory" aria-label="Local parent folder">↑</button>
                     <input type="text" class="path-input" id="local-path-input" value=""
                         placeholder="Enter local server path..."
                         onkeydown="handleAddressKey(event, 'local')">
-                    <button class="nav-btn" onclick="navigateToInput('local')" title="Go to path & set as destination">→</button>
-                    <button class="nav-btn" onclick="navigateToInput('local')" title="Refresh directory">↻</button>
+                    <button class="nav-btn" onclick="navigateToInput('local')" title="Go to path & set as destination" aria-label="Go to local path">→</button>
+                    <button class="nav-btn" onclick="navigateToInput('local')" title="Refresh directory" aria-label="Refresh local folder">↻</button>
+                    <button class="nav-btn mobile-filter-toggle" onclick="toggleMobileFilter('local')" title="Search files" aria-label="Filter local files">🔍</button>
                     <input type="text" class="filter-input" id="local-filter-input"
                         placeholder="🔍 Filter files..."
                         oninput="filterTreeItems('local', this.value)"
                         title="Quickly filter items in the local view">
+                </div>
+                <div class="mobile-dest-hint" id="local-dest-hint">
+                    <span>Push sends to:</span>
+                    <span class="mobile-dest-hint-path" id="local-dest-hint-path">—</span>
+                    <button onclick="setMobileTab('remote')" style="padding:3px 8px; font-size:11px;">Change</button>
                 </div>
                 <div class="breadcrumb-bar" id="local-breadcrumbs"></div>
                 <div class="list-header">
                     <span>Name</span>
                     <span>Modified</span>
                     <span>Size</span>
-                    <span style="text-align:right; padding-right:4px;">
+                    <span style="text-align:center;">
                         <input type="checkbox" id="local-select-all"
+                            aria-label="Select all local items"
                             title="Select or unselect all visible items in Local panel for PUSH transfer"
                             onchange="toggleSelectAll('local', this.checked)">
                     </span>
@@ -1008,7 +1621,7 @@
                             onclick="triggerSessionAction('cancel_transfer')">✖ Cancel (Remove Partial)</button>
                         <button id="sd-btn-rollback" class="btn-rollback" style="display:none; font-weight:600;"
                             onclick="triggerSessionAction('rollback_transfer')">⟲ Rollback Session Files</button>
-                        <button onclick="switchToNewTransferView()">← Back to File Browser</button>
+                        <button id="sd-btn-back" onclick="handleBackFromSessionDetail()">← Back</button>
                     </div>
                 </div>
 
@@ -1050,17 +1663,17 @@
 
             <div class="session-files-panel">
                 <div class="panel-title" style="flex-wrap:wrap; gap:10px;">
-                    <span id="sd-files-panel-heading">Transferred Files Log (Source Path & Saved Destination Path)</span>
-                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                    <span id="sd-files-panel-heading">Transferred Files Log</span>
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; width:auto;">
                         <input type="text" id="sd-files-search"
                             placeholder="🔍 Search session files..."
                             oninput="onSessionFilesSearch(this.value)"
                             style="background:var(--input-bg); border:1px solid var(--border-color); color:var(--text-main); padding:4px 8px; border-radius:5px; font-size:11.5px; width:175px; outline:none;">
                         <span id="sd-file-log-summary" style="color:var(--text-secondary); font-weight:normal;">0 items</span>
                         <div style="display:inline-flex; align-items:center; gap:4px;">
-                            <button id="sd-page-prev" onclick="changeSessionFilesPage(-1)" style="padding:3px 8px; font-size:11px;">« Prev</button>
-                            <span id="sd-page-info" style="font-size:11px; color:var(--text-secondary); font-family:Consolas,monospace; padding:0 4px;">Page 1/1</span>
-                            <button id="sd-page-next" onclick="changeSessionFilesPage(1)" style="padding:3px 8px; font-size:11px;">Next »</button>
+                            <button id="sd-page-prev" onclick="changeSessionFilesPage(-1)" style="padding:4px 10px; font-size:12px;">« Prev</button>
+                            <span id="sd-page-info" style="font-size:11.5px; color:var(--text-secondary); font-family:Consolas,monospace; padding:0 4px;">Page 1/1</span>
+                            <button id="sd-page-next" onclick="changeSessionFilesPage(1)" style="padding:4px 10px; font-size:12px;">Next »</button>
                         </div>
                     </div>
                 </div>
@@ -1084,27 +1697,54 @@
             </div>
             <div class="active-files-list" id="pb-files"></div>
         </div>
+
+        <!-- MOBILE THUMB-ZONE ACTION DOCK (Shown on mobile when items selected or transfer active) -->
+        <div class="mobile-action-dock" id="mobile-action-dock">
+            <div class="mobile-action-row" id="mobile-action-buttons"></div>
+        </div>
     </main>
+
+    <!-- MOBILE BOTTOM TAB NAVIGATION (Shown only <= 900px) -->
+    <nav class="mobile-bottom-nav" id="mobile-bottom-nav" aria-label="Mobile Navigation">
+        <button class="mobile-nav-item active" id="mnav-remote" onclick="setMobileTab('remote')">
+            <span class="mobile-nav-icon">📱</span>
+            <span>Remote</span>
+            <span class="mobile-nav-badge" id="mnav-badge-remote">0</span>
+        </button>
+        <button class="mobile-nav-item" id="mnav-local" onclick="setMobileTab('local')">
+            <span class="mobile-nav-icon">💻</span>
+            <span>Local</span>
+            <span class="mobile-nav-badge push-badge" id="mnav-badge-local">0</span>
+        </button>
+        <button class="mobile-nav-item" id="mnav-history" onclick="setMobileTab('history')">
+            <span class="mobile-nav-icon">🕒</span>
+            <span>History</span>
+        </button>
+        <button class="mobile-nav-item" id="mnav-clients" onclick="openConnectOverlay(true)">
+            <span class="mobile-nav-icon">🔌</span>
+            <span>Clients</span>
+        </button>
+    </nav>
 
     <!-- CLIENT DISCOVERY & PASSWORD AUTHENTICATION OVERLAY -->
     <div class="connect-overlay" id="connect-overlay">
         <div class="connect-card">
             <div class="connect-card-header">
                 <div>
-                    <h1>⚡ EFT v3.1 — Client Discovery & Authentication</h1>
-                    <p>Select any waiting client below and enter its password (if locked) to establish a two-way connection.</p>
+                    <h1>⚡ EFT v3.1 — Client Discovery</h1>
+                    <p>Tap a waiting client below to establish a two-way transfer link.</p>
                 </div>
-                <button onclick="closeConnectOverlay()">✕ Close</button>
+                <button onclick="closeConnectOverlay()" aria-label="Close client discovery">✕ Close</button>
             </div>
 
             <div class="connect-card-body">
                 <div class="server-info-banner">
                     <div>
-                        <strong>Server Host:</strong> <span id="welcome-server-name">Loading...</span>
+                        <strong>Server:</strong> <span id="welcome-server-name">Loading...</span>
                         (<span id="welcome-server-os">OS</span>)
                     </div>
                     <div>
-                        <strong>Server IP(s):</strong>
+                        <strong>IP(s):</strong>
                         <span id="welcome-server-ips" style="font-family:Consolas,monospace; color:#79c0ff;">—</span>
                     </div>
                 </div>
@@ -1113,7 +1753,7 @@
                 <div class="password-auth-box" id="password-auth-box">
                     <div class="password-auth-header">
                         <span id="pwd-prompt-title">🔒 Password Required for Client</span>
-                        <button onclick="cancelPasswordPrompt()" style="padding:2px 8px; font-size:11px;">Cancel</button>
+                        <button onclick="cancelPasswordPrompt()" style="padding:4px 10px; font-size:12px;">Cancel</button>
                     </div>
                     <div style="font-size:12px; color:var(--text-secondary);" id="pwd-prompt-subtitle">
                         This client configured a password on startup. Enter the client's password to connect:
@@ -1122,14 +1762,14 @@
                         <input type="password" id="client-auth-password-input"
                             placeholder="Enter client password..."
                             onkeydown="if(event.key==='Enter'){submitClientPasswordPrompt();}">
-                        <button onclick="togglePasswordVisibility('client-auth-password-input')" title="Show/Hide Password">👁</button>
+                        <button onclick="togglePasswordVisibility('client-auth-password-input')" title="Show/Hide Password" aria-label="Toggle password visibility">👁 Show</button>
                         <button class="btn-primary-connect" onclick="submitClientPasswordPrompt()">Authenticate & Connect</button>
                     </div>
                 </div>
 
-                <div style="display:flex; justify-content:space-between; align-items:center;">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap;">
                     <span style="font-weight:600; font-size:13px;">Waiting Clients on Network</span>
-                    <button onclick="refreshWaitingClients(true)">↻ Scan for Waiting Clients</button>
+                    <button onclick="refreshWaitingClients(true)" style="min-height:36px;">↻ Scan Network</button>
                 </div>
 
                 <div class="clients-grid" id="waiting-clients-container">
@@ -1148,7 +1788,92 @@
 
                 <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
                     <div id="connect-feedback" style="font-size:12px; color:var(--text-secondary);"></div>
-                    <div id="curl-helper-text" style="font-size:11px; color:var(--text-muted); font-family:Consolas,monospace;"></div>
+                    <div id="curl-helper-text" style="font-size:11px; color:var(--text-muted); font-family:Consolas,monospace; word-break:break-all;"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- FILE CONFLICT RESOLUTION MODAL -->
+    <div class="connect-overlay" id="conflict-overlay" style="z-index: 1200;">
+        <div class="connect-card" style="max-width: 820px;">
+            <div class="connect-card-header">
+                <div>
+                    <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                        <h1 id="conflict-modal-title">⚠️ File Already Exists</h1>
+                        <span id="conflict-counter-badge" class="badge badge-paused">1 of 1</span>
+                        <span id="conflict-dir-badge" class="badge-pull">⬅ PULL</span>
+                    </div>
+                    <p id="conflict-modal-sub">A file with the same name already exists at the destination. Compare details below and choose an action.</p>
+                </div>
+            </div>
+            <div class="connect-card-body">
+                <div class="conflict-diff-bar" id="conflict-diff-bar"></div>
+
+                <div class="conflict-compare-grid">
+                    <div class="conflict-file-card" style="border-color: rgba(47, 129, 247, 0.45);">
+                        <div class="conflict-card-title" style="color: #79c0ff;">
+                            <span>📥 Incoming File (To Be Written)</span>
+                        </div>
+                        <div class="conflict-field">
+                            <span class="conflict-field-label">File Name</span>
+                            <span class="conflict-field-val" id="cf-inc-name">—</span>
+                        </div>
+                        <div class="conflict-field">
+                            <span class="conflict-field-label">Size</span>
+                            <span class="conflict-field-val" id="cf-inc-size">—</span>
+                        </div>
+                        <div class="conflict-field">
+                            <span class="conflict-field-label">Date Modified</span>
+                            <span class="conflict-field-val" id="cf-inc-mtime">—</span>
+                        </div>
+                        <div class="conflict-field">
+                            <span class="conflict-field-label">Date Accessed</span>
+                            <span class="conflict-field-val" id="cf-inc-atime">—</span>
+                        </div>
+                        <div class="conflict-field">
+                            <span class="conflict-field-label">Source Path</span>
+                            <span class="conflict-field-val" id="cf-inc-path">—</span>
+                        </div>
+                    </div>
+
+                    <div class="conflict-file-card" style="border-color: rgba(210, 153, 34, 0.45);">
+                        <div class="conflict-card-title" style="color: #e3b341;">
+                            <span>💾 Existing File (Already on Disk)</span>
+                        </div>
+                        <div class="conflict-field">
+                            <span class="conflict-field-label">File Name</span>
+                            <span class="conflict-field-val" id="cf-ex-name">—</span>
+                        </div>
+                        <div class="conflict-field">
+                            <span class="conflict-field-label">Size</span>
+                            <span class="conflict-field-val" id="cf-ex-size">—</span>
+                        </div>
+                        <div class="conflict-field">
+                            <span class="conflict-field-label">Date Modified</span>
+                            <span class="conflict-field-val" id="cf-ex-mtime">—</span>
+                        </div>
+                        <div class="conflict-field">
+                            <span class="conflict-field-label">Date Accessed</span>
+                            <span class="conflict-field-val" id="cf-ex-atime">—</span>
+                        </div>
+                        <div class="conflict-field">
+                            <span class="conflict-field-label">Destination Path</span>
+                            <span class="conflict-field-val" id="cf-ex-path">—</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="conflict-footer">
+                    <label style="display:flex; align-items:center; gap:10px; cursor:pointer; font-weight:600; color:var(--text-main);">
+                        <input type="checkbox" id="conflict-apply-all">
+                        <span>Apply to all remaining conflicts in this transfer</span>
+                    </label>
+                    <div class="conflict-actions-row" style="display:flex; gap:8px; flex-wrap:wrap;">
+                        <button onclick="resolveConflict('skip')" title="Keep existing file untouched and skip this incoming file">⏭ Skip</button>
+                        <button class="btn-rollback" onclick="resolveConflict('overwrite')" title="Replace existing file with incoming file">♻ Overwrite</button>
+                        <button class="btn-primary-connect" id="btn-conflict-rename" onclick="resolveConflict('rename')" title="Keep existing file and save incoming file with _(1) suffix">📝 Rename</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1161,10 +1886,12 @@
         };
 
         let currentViewMode = 'new_transfer';
+        let activeMobileTab = 'remote';
         let selectedSessionToken = null;
         let welcomeAutoShown = false;
         let lastPeerSeq = -1;
         let pendingAuthTarget = null;
+        let activeConflictId = null;
 
         let lastProgressData = {
             state: 'idle',
@@ -1181,6 +1908,10 @@
             can_rollback: false,
             rollback_files_count: 0
         };
+
+        function isMobileView() {
+            return window.innerWidth <= 900;
+        }
 
         function formatBytes(bytes) {
             if (!bytes || bytes <= 0) return '0 B';
@@ -1227,10 +1958,88 @@
             document.getElementById('sidebar').classList.toggle('collapsed');
         }
 
+        function toggleMobileFilter(source) {
+            const bar = document.getElementById(`${source}-address-bar`);
+            if (!bar) return;
+            const isOpen = bar.classList.toggle('filter-open');
+            const inp = document.getElementById(`${source}-filter-input`);
+            if (isOpen && inp) {
+                setTimeout(() => inp.focus(), 40);
+            } else if (inp) {
+                inp.value = '';
+                filterTreeItems(source, '');
+            }
+        }
+
+        function setMobileTab(tab) {
+            activeMobileTab = tab;
+            const sidebar = document.getElementById('sidebar');
+            const mainArea = document.getElementById('main-area');
+            const remotePanel = document.getElementById('remote-panel');
+            const localPanel = document.getElementById('local-panel');
+
+            document.querySelectorAll('.mobile-nav-item').forEach(btn => btn.classList.remove('active'));
+            const activeBtn = document.getElementById(`mnav-${tab}`);
+            if (activeBtn) activeBtn.classList.add('active');
+
+            if (tab === 'history') {
+                if (isMobileView()) {
+                    sidebar.classList.add('mobile-view-active');
+                    mainArea.classList.add('mobile-hidden');
+                }
+                loadSessionsSidebar();
+            } else {
+                sidebar.classList.remove('mobile-view-active');
+                mainArea.classList.remove('mobile-hidden');
+                currentViewMode = 'new_transfer';
+                selectedSessionToken = null;
+                document.getElementById('new-transfer-view').style.display = 'grid';
+                document.getElementById('session-detail-view').style.display = 'none';
+                document.querySelectorAll('.history-item').forEach(el => el.classList.remove('active'));
+
+                const isRemote = (tab === 'remote');
+                remotePanel.classList.toggle('mobile-active', isRemote);
+                localPanel.classList.toggle('mobile-active', !isRemote);
+            }
+            updateSmartToolbar();
+        }
+
+        function syncLayoutForViewport() {
+            const sidebar = document.getElementById('sidebar');
+            const mainArea = document.getElementById('main-area');
+            if (!isMobileView()) {
+                sidebar.classList.remove('mobile-view-active');
+                mainArea.classList.remove('mobile-hidden');
+            } else {
+                if (currentViewMode === 'session_detail') {
+                    sidebar.classList.remove('mobile-view-active');
+                    mainArea.classList.remove('mobile-hidden');
+                } else if (activeMobileTab === 'history') {
+                    sidebar.classList.add('mobile-view-active');
+                    mainArea.classList.add('mobile-hidden');
+                } else {
+                    sidebar.classList.remove('mobile-view-active');
+                    mainArea.classList.remove('mobile-hidden');
+                }
+            }
+            updateSmartToolbar();
+        }
+
+        window.addEventListener('resize', syncLayoutForViewport);
+
         function togglePasswordVisibility(inputId) {
             const el = document.getElementById(inputId);
             if (!el) return;
             el.type = el.type === 'password' ? 'text' : 'password';
+        }
+
+        function updateMobileDestHints() {
+            const locPath = panelState.local.currentPath || document.getElementById('local-path-input').value.trim() || 'Not set';
+            const remPath = panelState.remote.currentPath || document.getElementById('remote-path-input').value.trim() || 'Offline';
+            const remHint = document.getElementById('remote-dest-hint-path');
+            const locHint = document.getElementById('local-dest-hint-path');
+            if (remHint) remHint.innerText = locPath;
+            if (locHint) locHint.innerText = remPath;
         }
 
         function renderBreadcrumbs(source, fullPath) {
@@ -1329,7 +2138,13 @@
             updateSmartToolbar();
         }
 
-        function resetRemoteBrowserState(reasonMsg = 'No client connected. Click "Connect / Switch Client" to choose a waiting device.') {
+        function clearSelections(source) {
+            toggleSelectAll(source, false);
+            const selAll = document.getElementById(`${source}-select-all`);
+            if (selAll) selAll.checked = false;
+        }
+
+        function resetRemoteBrowserState(reasonMsg = 'No client connected. Tap "Clients" to connect a waiting device.') {
             panelState.remote.currentPath = '';
             panelState.remote.parentPath = '';
             panelState.remote.initialized = false;
@@ -1337,12 +2152,13 @@
             document.getElementById('remote-filter-input').value = '';
             document.getElementById('remote-select-all').checked = false;
             document.getElementById('remote-os-badge').innerText = 'REMOTE';
-            document.getElementById('remote-panel-label').innerText = '📱 Remote Client Device (Not Connected)';
+            document.getElementById('remote-panel-label').innerText = '📱 Remote Client (Not Connected)';
             document.getElementById('remote-breadcrumbs').innerHTML = '<span style="color:var(--text-muted);">Offline</span>';
             document.getElementById('remote-footer-stats').innerText = '0 folders, 0 files';
             document.getElementById('remote-footer-selected').innerText = '0 selected (Pull ⬅)';
             document.getElementById('remote-tree').innerHTML =
-                `<div class="empty-state-box">${escapeHtml(reasonMsg)}</div>`;
+                `<div class="empty-state-box">${escapeHtml(reasonMsg)}<br><br><button class="btn-primary-connect" style="min-height:42px;" onclick="openConnectOverlay(true)">🔌 Connect a Client</button></div>`;
+            updateMobileDestHints();
             updateSmartToolbar();
         }
 
@@ -1350,10 +2166,28 @@
         function switchToNewTransferView() {
             currentViewMode = 'new_transfer';
             selectedSessionToken = null;
+            document.getElementById('sidebar').classList.remove('mobile-view-active');
+            document.getElementById('main-area').classList.remove('mobile-hidden');
             document.getElementById('new-transfer-view').style.display = 'grid';
             document.getElementById('session-detail-view').style.display = 'none';
             document.querySelectorAll('.history-item').forEach(el => el.classList.remove('active'));
+            if (isMobileView() && activeMobileTab === 'history') {
+                setMobileTab('remote');
+                return;
+            }
             updateSmartToolbar();
+        }
+
+        function handleBackFromSessionDetail() {
+            if (isMobileView()) {
+                selectedSessionToken = null;
+                currentViewMode = 'new_transfer';
+                document.getElementById('session-detail-view').style.display = 'none';
+                document.getElementById('new-transfer-view').style.display = 'grid';
+                setMobileTab('history');
+            } else {
+                switchToNewTransferView();
+            }
         }
 
         let sessionFilesPage = 1;
@@ -1383,9 +2217,13 @@
                 if (sInput) sInput.value = '';
             }
             selectedSessionToken = sessionToken;
+            document.getElementById('sidebar').classList.remove('mobile-view-active');
+            document.getElementById('main-area').classList.remove('mobile-hidden');
             document.getElementById('new-transfer-view').style.display = 'none';
             document.getElementById('session-detail-view').style.display = 'flex';
             document.getElementById('progress-box').style.display = 'none';
+            const backBtn = document.getElementById('sd-btn-back');
+            if (backBtn) backBtn.innerText = isMobileView() ? '← Back to History' : '← Back to File Browser';
             updateSmartToolbar();
             await refreshSelectedSessionDetail();
             await loadSessionsSidebar();
@@ -1477,7 +2315,7 @@
 
                         return `
                         <div class="files-table-row" title="Relative Path: ${escapeHtml(f.relative_path || '')}">
-                            <div style="overflow:hidden; text-overflow:ellipsis; padding-right:12px; display:flex; flex-direction:column; gap:3px;">
+                            <div style="overflow:hidden; text-overflow:ellipsis; padding-right:8px; display:flex; flex-direction:column; gap:3px;">
                                 <div style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
                                     ${itemIcon} <strong>${escapeHtml(displayName)}</strong>
                                 </div>
@@ -1491,7 +2329,7 @@
                                 </div>
                             </div>
                             <div style="color:var(--text-secondary); font-family:Consolas,monospace;">${sizeLabel}</div>
-                            <div style="color:var(--text-secondary); font-family:Consolas,monospace;">${f.chunks_done}/${f.chunks_total}</div>
+                            <div style="color:var(--text-secondary); font-family:Consolas,monospace;">${f.chunks_done}/${f.chunks_total} chunks</div>
                             <div><span class="${getStatusBadgeClass(f.status)}">${escapeHtml(f.status)}</span></div>
                             <div style="color:var(--text-secondary);">${f.transferred_at ? formatDate(f.transferred_at, true) : 'Not completed'}</div>
                         </div>
@@ -1500,7 +2338,7 @@
                 }
             } catch (e) {}
         }
-        
+
         async function triggerSessionAction(actionType, explicitToken = null) {
             const targetToken = explicitToken || selectedSessionToken;
             if (!targetToken) return;
@@ -1552,7 +2390,7 @@
                     topRow.className = 'history-item-top';
                     topRow.innerHTML = `
                         <span class="history-title">📁 ${escapeHtml(sess.title)}</span>
-                        <div style="display:flex; gap:4px; align-items:center;">
+                        <div style="display:flex; gap:4px; align-items:center; flex-shrink:0;">
                             ${dirBadgeHtml}
                             <span class="${getStatusBadgeClass(sess.status)}">${escapeHtml(sess.status.replace('_', ' '))}</span>
                         </div>
@@ -1677,14 +2515,14 @@
                     left.className = 'client-meta-main';
                     left.innerHTML = `
                         <div class="client-device-icon">${osIcon}</div>
-                        <div>
+                        <div style="min-width:0; flex:1;">
                             <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
                                 <span style="font-weight:600; font-size:13.5px; color:#fff;">${escapeHtml(c.hostname)}</span>
                                 <span class="os-badge">${escapeHtml((c.os || 'os').toUpperCase())}</span>
                                 ${securityBadge}
                             </div>
-                            <div style="font-size:11.5px; color:var(--text-secondary); font-family:Consolas,monospace; margin-top:3px;">
-                                IP: ${escapeHtml(c.ip)}:${c.invite_port} · ID: ${escapeHtml(c.client_id)} · Seen ${c.age_seconds}s ago
+                            <div style="font-size:11.5px; color:var(--text-secondary); font-family:Consolas,monospace; margin-top:3px; word-break:break-all;">
+                                IP: ${escapeHtml(c.ip)}:${c.invite_port} · Seen ${c.age_seconds}s ago
                             </div>
                         </div>
                     `;
@@ -1693,6 +2531,7 @@
                     right.style.display = 'flex';
                     right.style.gap = '8px';
                     right.style.alignItems = 'center';
+                    right.style.flexWrap = 'wrap';
 
                     if (c.is_connected) {
                         const connBadge = document.createElement('span');
@@ -1708,7 +2547,7 @@
                     } else {
                         const btn = document.createElement('button');
                         btn.className = 'btn-primary-connect';
-                        btn.innerText = c.requires_password ? '🔑 Enter Password & Connect' : 'Click to Connect';
+                        btn.innerText = c.requires_password ? '🔑 Enter Password & Connect' : 'Tap to Connect';
                         btn.onclick = () => {
                             if (c.requires_password) {
                                 openPasswordPromptForClient(c.client_id, c.ip, c.invite_port, c.hostname);
@@ -1785,10 +2624,85 @@
         async function disconnectCurrentClient() {
             try {
                 await fetch('/api/clients/disconnect', { method: 'POST' });
-                resetRemoteBrowserState('Disconnected from client. Click "Connect / Switch Client" to connect to any waiting client.');
+                resetRemoteBrowserState('Disconnected from client. Tap "Clients" to connect to a waiting device.');
                 await pollProgress();
                 await refreshWaitingClients(true);
             } catch (e) {}
+        }
+
+        /* --- FILE CONFLICT RESOLUTION MODAL --- */
+        function renderConflictModal(conflict) {
+            const overlay = document.getElementById('conflict-overlay');
+            if (!conflict) {
+                activeConflictId = null;
+                overlay.style.display = 'none';
+                return;
+            }
+            if (activeConflictId === conflict.conflict_id) return;
+            activeConflictId = conflict.conflict_id;
+
+            const isPush = (conflict.direction || 'pull').toLowerCase() === 'push';
+            const dirBadge = document.getElementById('conflict-dir-badge');
+            dirBadge.className = isPush ? 'badge-push' : 'badge-pull';
+            dirBadge.innerText = isPush ? '➡ PUSH' : '⬅ PULL';
+
+            document.getElementById('conflict-counter-badge').innerText =
+                `Conflict ${conflict.index} of ${conflict.total}`;
+            document.getElementById('conflict-apply-all').checked = false;
+
+            const inc = conflict.incoming;
+            const ex = conflict.existing;
+
+            document.getElementById('cf-inc-name').innerText = inc.name;
+            document.getElementById('cf-inc-size').innerText = `${formatBytes(inc.size)} (${inc.size.toLocaleString()} bytes)`;
+            document.getElementById('cf-inc-mtime').innerText = formatDate(inc.mtime, true);
+            document.getElementById('cf-inc-atime').innerText = formatDate(inc.atime, true);
+            document.getElementById('cf-inc-path').innerText = inc.source_path;
+
+            document.getElementById('cf-ex-name').innerText = ex.name;
+            document.getElementById('cf-ex-size').innerText = `${formatBytes(ex.size)} (${ex.size.toLocaleString()} bytes)`;
+            document.getElementById('cf-ex-mtime').innerText = formatDate(ex.mtime, true);
+            document.getElementById('cf-ex-atime').innerText = formatDate(ex.atime, true);
+            document.getElementById('cf-ex-path').innerText = ex.save_path;
+
+            const sizeDelta = inc.size - ex.size;
+            const sizeSummary = sizeDelta === 0
+                ? '⚖️ Exact same size'
+                : (sizeDelta > 0
+                    ? `📈 Incoming is ${formatBytes(sizeDelta)} larger`
+                    : `📉 Incoming is ${formatBytes(Math.abs(sizeDelta))} smaller`);
+
+            const timeDelta = inc.mtime - ex.mtime;
+            const timeSummary = Math.abs(timeDelta) < 1
+                ? '🕒 Same modified timestamp'
+                : (timeDelta > 0 ? '🆕 Incoming file is newer' : '🕰️ Existing file is newer');
+
+            document.getElementById('conflict-diff-bar').innerHTML =
+                `<span>${sizeSummary}</span><span>•</span><span>${timeSummary}</span>`;
+
+            document.getElementById('btn-conflict-rename').innerText =
+                `📝 Rename (${conflict.renamed_preview_name})`;
+
+            overlay.style.display = 'flex';
+        }
+
+        async function resolveConflict(decision) {
+            if (!activeConflictId) return;
+            const conflictId = activeConflictId;
+            const applyToAll = document.getElementById('conflict-apply-all').checked;
+            document.getElementById('conflict-overlay').style.display = 'none';
+            activeConflictId = null;
+
+            await fetch('/api/conflict/resolve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    conflict_id: conflictId,
+                    decision: decision,
+                    apply_to_all: applyToAll
+                })
+            });
+            await pollProgress();
         }
 
         /* --- DIRECTORY NAVIGATION & TREE RENDERING --- */
@@ -1820,14 +2734,23 @@
             const clientOnline = !!lastProgressData.client_online;
 
             const remSelFooter = document.getElementById('remote-footer-selected');
-            if (remSelFooter) {
-                remSelFooter.innerText = `${remoteCheckedCount} selected (Pull ⬅)`;
-            }
+            if (remSelFooter) remSelFooter.innerText = `${remoteCheckedCount} selected (Pull ⬅)`;
             const locSelFooter = document.getElementById('local-footer-selected');
-            if (locSelFooter) {
-                locSelFooter.innerText = `${localCheckedCount} selected (Push ➡)`;
+            if (locSelFooter) locSelFooter.innerText = `${localCheckedCount} selected (Push ➡)`;
+
+            // Update mobile bottom-nav badges
+            const remBadge = document.getElementById('mnav-badge-remote');
+            if (remBadge) {
+                remBadge.innerText = remoteCheckedCount;
+                remBadge.classList.toggle('visible', remoteCheckedCount > 0);
+            }
+            const locBadge = document.getElementById('mnav-badge-local');
+            if (locBadge) {
+                locBadge.innerText = localCheckedCount;
+                locBadge.classList.toggle('visible', localCheckedCount > 0);
             }
 
+            // Desktop toolbar
             const btnPull = document.getElementById('btn-copy-pull');
             const btnPush = document.getElementById('btn-copy-push');
             const btnPause = document.getElementById('btn-pause');
@@ -1846,37 +2769,71 @@
             if (currentViewMode === 'session_detail') {
                 hint.style.display = 'inline';
                 hint.innerText = 'Inspecting Transfer Session History';
+            } else {
+                if (state !== 'active' && clientOnline) {
+                    if (remoteCheckedCount > 0) {
+                        btnPull.style.display = 'inline-flex';
+                        btnPull.innerText = `⬅ Pull to Local (${remoteCheckedCount})`;
+                    }
+                    if (localCheckedCount > 0) {
+                        btnPush.style.display = 'inline-flex';
+                        btnPush.innerText = `➡ Push to Remote (${localCheckedCount})`;
+                    }
+                }
+                if (state === 'active') {
+                    btnPause.style.display = 'inline-flex';
+                    btnCancel.style.display = 'inline-flex';
+                }
+                if (state === 'active' && lastProgressData.can_rollback) {
+                    btnRollback.style.display = 'inline-flex';
+                }
+
+                const anyVisible = [btnPull, btnPush, btnPause, btnCancel, btnRollback].some(b => b.style.display !== 'none');
+                if (!anyVisible) {
+                    hint.style.display = 'inline';
+                    hint.innerText = clientOnline
+                        ? 'Check items on Remote (Pull ⬅) or Local (Push ➡) to start a transfer'
+                        : 'No client connected — click "Connect / Switch Client"';
+                } else {
+                    hint.style.display = 'none';
+                }
+            }
+
+            // Mobile thumb-zone action dock
+            const dock = document.getElementById('mobile-action-dock');
+            const dockBtns = document.getElementById('mobile-action-buttons');
+            if (!dock || !dockBtns) return;
+
+            if (!isMobileView() || currentViewMode !== 'new_transfer' || activeMobileTab === 'history') {
+                dock.style.display = 'none';
                 return;
             }
 
-            if (state !== 'active' && clientOnline) {
+            let html = '';
+            if (state === 'active') {
+                html += `<button class="btn-pause" onclick="sendCommand('pause_transfer')">⏸ Pause</button>`;
+                html += `<button class="btn-cancel" onclick="sendCommand('cancel_transfer')">✖ Cancel</button>`;
+                if (lastProgressData.can_rollback) {
+                    html += `<button class="btn-rollback" onclick="sendCommand('rollback_transfer')">⟲ Rollback</button>`;
+                }
+            } else if (clientOnline) {
                 if (remoteCheckedCount > 0) {
-                    btnPull.style.display = 'inline-flex';
-                    btnPull.innerText = `⬅ Pull to Local (${remoteCheckedCount})`;
+                    html += `<button class="btn-copy" onclick="sendCommand('start_transfer', 'pull')">⬅ Pull (${remoteCheckedCount})</button>`;
                 }
                 if (localCheckedCount > 0) {
-                    btnPush.style.display = 'inline-flex';
-                    btnPush.innerText = `➡ Push to Remote (${localCheckedCount})`;
+                    html += `<button class="btn-push" onclick="sendCommand('start_transfer', 'push')">➡ Push (${localCheckedCount})</button>`;
+                }
+                if (remoteCheckedCount > 0 || localCheckedCount > 0) {
+                    const clearTarget = (activeMobileTab === 'local' && localCheckedCount > 0) ? 'local' : 'remote';
+                    html += `<button style="flex:0 0 auto; min-width:68px;" onclick="clearSelections('${clearTarget}')">Clear</button>`;
                 }
             }
 
-            if (state === 'active') {
-                btnPause.style.display = 'inline-flex';
-                btnCancel.style.display = 'inline-flex';
-            }
-
-            if (state === 'active' && lastProgressData.can_rollback) {
-                btnRollback.style.display = 'inline-flex';
-            }
-
-            const anyVisible = [btnPull, btnPush, btnPause, btnCancel, btnRollback].some(b => b.style.display !== 'none');
-            if (!anyVisible) {
-                hint.style.display = 'inline';
-                hint.innerText = clientOnline
-                    ? 'Check items on Remote (Pull ⬅) or Local (Push ➡) to start a transfer'
-                    : 'No client connected — click "Connect / Switch Client"';
+            if (html) {
+                dockBtns.innerHTML = html;
+                dock.style.display = 'flex';
             } else {
-                hint.style.display = 'none';
+                dock.style.display = 'none';
             }
         }
 
@@ -1919,6 +2876,7 @@
                         panelState[source].currentPath = data.current_path;
                         document.getElementById(`${source}-path-input`).value = data.current_path;
                         renderBreadcrumbs(source, data.current_path);
+                        updateMobileDestHints();
                         if (source === 'local') {
                             document.getElementById('local-footer-dest').innerText = `Save Target: ${data.current_path}`;
                         }
@@ -1958,12 +2916,16 @@
                         const row = document.createElement('div');
                         row.className = 'tree-item-container';
                         row.title = item.is_dir
-                            ? `Click to expand folder: ${item.path} (Double-click to open as root)`
+                            ? `Folder: ${item.path}`
                             : `File: ${item.path} (${formatBytes(item.size)})`;
+
+                        const mobileSub = item.is_dir
+                            ? `Folder${item.mtime ? ' · ' + formatDate(item.mtime) : ''}`
+                            : `${formatBytes(item.size)} · ${formatDate(item.mtime)}`;
 
                         const nameCol = document.createElement('div');
                         nameCol.className = 'item-name';
-                        nameCol.innerHTML = `${expander}${icon}<span class="item-label ${item.is_dir ? 'is-folder' : ''}">${escapeHtml(item.name)}</span>`;
+                        nameCol.innerHTML = `${expander}${icon}<div class="item-text-wrap"><span class="item-label ${item.is_dir ? 'is-folder' : ''}">${escapeHtml(item.name)}</span><span class="item-submeta">${escapeHtml(mobileSub)}</span></div>`;
 
                         const dateCol = document.createElement('div');
                         dateCol.className = 'item-date';
@@ -1980,6 +2942,7 @@
                             cb = document.createElement('input');
                             cb.type = 'checkbox';
                             cb.value = item.path;
+                            cb.setAttribute('aria-label', `Select ${item.name}`);
                             cb.title = source === 'remote'
                                 ? `Select ${item.name} to PULL to Local Server`
                                 : `Select ${item.name} to PUSH to Remote Client`;
@@ -1987,6 +2950,14 @@
                             cb.onchange = () => {
                                 row.classList.toggle('selected-row', cb.checked);
                                 updateSmartToolbar();
+                            };
+                            checkCol.onclick = (e) => {
+                                e.stopPropagation();
+                                if (e.target !== cb) {
+                                    cb.checked = !cb.checked;
+                                    row.classList.toggle('selected-row', cb.checked);
+                                    updateSmartToolbar();
+                                }
                             };
                             checkCol.appendChild(cb);
                         }
@@ -2000,7 +2971,13 @@
                         childrenContainer.className = 'children-container';
 
                         if (item.is_dir) {
-                            row.onclick = () => toggleFolder(node, source, item.path);
+                            row.onclick = () => {
+                                if (isMobileView()) {
+                                    initializeRoot(source, item.path);
+                                } else {
+                                    toggleFolder(node, source, item.path);
+                                }
+                            };
                             row.ondblclick = (e) => {
                                 e.stopPropagation();
                                 initializeRoot(source, item.path);
@@ -2032,6 +3009,7 @@
             document.getElementById(`${source}-path-input`).value = path;
             panelState[source].currentPath = path;
             renderBreadcrumbs(source, path);
+            updateMobileDestHints();
 
             if (source === 'local' && path !== 'DRIVES') {
                 document.getElementById('local-footer-dest').innerText = `Save Target: ${path}`;
@@ -2112,6 +3090,7 @@
                 const peerChanged = (lastPeerSeq !== -1 && data.peer_seq !== lastPeerSeq);
                 lastPeerSeq = data.peer_seq || 0;
                 lastProgressData = data;
+                renderConflictModal(data.pending_conflict);
 
                 if (data.server_hostname) {
                     const srvIps = (data.server_ips || []).join(', ');
@@ -2132,7 +3111,7 @@
                     document.getElementById('remote-path-input').value = '';
                     initializeRoot('remote', '');
                 } else if (!data.client_online && prevOnline) {
-                    resetRemoteBrowserState('Remote client disconnected. Click "Connect / Switch Client" to connect a waiting client.');
+                    resetRemoteBrowserState('Remote client disconnected. Tap "Clients" to connect a waiting device.');
                 }
 
                 if (prevState === 'active' && data.state === 'completed') {
@@ -2146,26 +3125,44 @@
                 }
 
                 const clientPill = document.getElementById('client-status-pill');
+                const mobileChip = document.getElementById('mobile-peer-chip');
                 if (data.client_online && data.connected_client) {
                     const c = data.connected_client;
                     const lockIcon = c.requires_password ? '🔒 ' : '🟢 ';
                     clientPill.innerText = `${lockIcon}Client: ${c.hostname} (${c.ip})`;
                     clientPill.className = 'status-pill status-online';
+                    if (mobileChip) {
+                        mobileChip.innerText = `${lockIcon}${c.hostname}`;
+                        mobileChip.className = 'mobile-peer-chip online';
+                    }
                     document.getElementById('remote-panel-label').innerText =
-                        `📱 Remote Client: ${c.hostname} (${c.ip})`;
+                        `📱 Remote: ${c.hostname} (${c.ip})`;
                     if (c.os) {
                         document.getElementById('remote-os-badge').innerText = c.os.toUpperCase();
                     }
                 } else {
                     clientPill.innerText = '🔴 Client: Offline';
                     clientPill.className = 'status-pill status-offline';
+                    if (mobileChip) {
+                        mobileChip.innerText = '🔴 Connect';
+                        mobileChip.className = 'mobile-peer-chip offline';
+                    }
                 }
 
                 const statePill = document.getElementById('transfer-state-pill');
+                const stateVal = (data.state || 'idle').toUpperCase();
                 const dirPrefix = data.state === 'active'
                     ? ((data.direction || 'pull').toLowerCase() === 'push' ? '➡ PUSH: ' : '⬅ PULL: ')
                     : 'State: ';
-                statePill.innerText = `${dirPrefix}${(data.state || 'idle').toUpperCase()}`;
+                statePill.innerText = `${dirPrefix}${stateVal}`;
+
+                const mobileStateBadge = document.getElementById('mobile-state-badge');
+                if (mobileStateBadge) {
+                    mobileStateBadge.className = getStatusBadgeClass(data.state || 'cancelled');
+                    mobileStateBadge.innerText = data.state === 'active'
+                        ? `${(data.direction || 'pull').toUpperCase()} ${data.percent}%`
+                        : stateVal;
+                }
 
                 const box = document.getElementById('progress-box');
                 if (currentViewMode === 'new_transfer' && data.state === 'active') {
@@ -2173,7 +3170,7 @@
                     box.style.display = 'block';
                     document.getElementById('pb-fill').style.width = data.percent + '%';
                     document.getElementById('pb-text').innerText =
-                        `${data.percent}% ${isPush ? '➡ Pushing to Remote Client...' : '⬅ Pulling to Local Host (Server)...'}`;
+                        `${data.percent}% ${isPush ? '➡ Pushing to Remote...' : '⬅ Pulling to Local...'}`;
                     document.getElementById('pb-chunks').innerText = `${data.received} / ${data.total} Chunks`;
                     document.getElementById('pb-files').innerText =
                         (data.active_files || []).map(f => `[${f.done}/${f.total}] ${f.relative_path || f.name}`).join(' | ');
@@ -2197,6 +3194,7 @@
         setInterval(loadSessionsSidebar, 2500);
 
         window.onload = async () => {
+            syncLayoutForViewport();
             await initializeRoot('local', '');
             await loadSessionsSidebar();
             await pollProgress();
